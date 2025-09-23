@@ -287,8 +287,6 @@ def rasterization(
     assert Ks.shape == batch_dims + (C, 3, 3), Ks.shape
     assert render_mode in ["RGB", "D", "ED", "RGB+D", "RGB+ED"], render_mode
 
-    print(f"Starting rasterization with {N} gaussians and {C} cameras.")
-
     def reshape_view(C: int, world_view: torch.Tensor, N_world: list) -> torch.Tensor:
         view_list = list(
             map(

@@ -3,6 +3,7 @@ import struct
 import warnings
 
 import numpy as np
+from plyfile import PlyData
 import torch
 import torch.nn.functional as F
 from torch import Tensor
@@ -345,6 +346,76 @@ def load_ply(path: str, device: str = "cuda") -> dict:
 
     return splats_dict
 
+def load_ply_milo(path: str, device: str = "cuda"):
+    """
+    Loads splat data from a .ply file created by the specific save function.
+
+    Args:
+        path (str): The path to the .ply file.
+        device (str): The device to move the loaded tensors to (e.g., "cuda" or "cpu").
+
+    Returns:
+        A dictionary containing the loaded Gaussian splatting parameters as PyTorch tensors.
+    """
+    print(f"Loading ply from {path}")
+    try:
+        plydata = PlyData.read(path)
+    except Exception as e:
+        print(f"Error reading PLY file: {e}")
+        return {}
+
+    vertices = plydata['vertex']
+    
+    # --- Extract all properties from the PLY file ---
+    
+    # Get all available property names from the file header
+    prop_names = {p.name for p in vertices.properties}
+
+    # Means (Position)
+    means = np.vstack([vertices['x'], vertices['y'], vertices['z']]).T
+
+    # Opacities
+    opacities = vertices['opacity'][:, np.newaxis]
+
+    # Scales
+    scale_props = sorted([p for p in prop_names if p.startswith("scale_")])
+    scales = np.stack([vertices[prop] for prop in scale_props], axis=-1)
+
+    # Quaternions (Rotation)
+    rot_props = sorted([p for p in prop_names if p.startswith("rot_")])
+    quats = np.stack([vertices[prop] for prop in rot_props], axis=-1)
+
+    # --- Spherical Harmonics (Color) ---
+    # f_dc corresponds to the first SH coefficient (sh0)
+    dc_props = sorted([p for p in prop_names if p.startswith("f_dc_")])
+    sh0_flat = np.stack([vertices[prop] for prop in dc_props], axis=-1)
+    print(f"Found {len(dc_props)} f_dc_ properties.")
+    
+    # Reshape from [N, 3] to [N, 1, 3]
+    sh0 = sh0_flat.reshape(-1, 1, 3)
+
+    # f_rest corresponds to the remaining SH coefficients (shN)
+    rest_props = sorted([p for p in prop_names if p.startswith("f_rest_")])
+    shN_flat = np.stack([vertices[prop] for prop in rest_props], axis=-1)
+    print(f"Found {len(rest_props)} f_rest_ properties.")
+    
+    # The number of remaining coefficients is the number of properties divided by 3 (for RGB)
+    num_sh_rest = len(rest_props) // 3
+    # Reshape from [N, 45] to [N, 15, 3] (assuming SH degree 3)
+    shN = shN_flat.reshape(-1, num_sh_rest, 3)
+
+    # --- Create the output dictionary and convert to Tensors ---
+    splats_dict = {
+        "means": torch.from_numpy(means).float().to(device),
+        "opacities": torch.from_numpy(opacities).float().to(device),
+        "scales": torch.from_numpy(scales).float().to(device),
+        "quats": torch.from_numpy(quats).float().to(device),
+        "sh0": torch.from_numpy(sh0).float().to(device),
+        "shN": torch.from_numpy(shN).float().to(device),
+    }
+    
+    print(f"✅ Successfully loaded {means.shape[0]} splats.")
+    return splats_dict
 
 
 # def depth_to_normal(

@@ -537,7 +537,6 @@ class Runner:
             rasterize_mode = "antialiased" if self.cfg.antialiased else "classic"
         if camera_model is None:
             camera_model = self.cfg.camera_model
-        print("Starting rasterization in Runner")
         render_colors, render_alphas, info = rasterization(
             means=means,
             quats=quats,

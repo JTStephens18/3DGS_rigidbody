@@ -11,9 +11,10 @@ from torch import Tensor
 from typing import Optional
 import warnings
 import argparse
+import time
 
 from examples.simple_trainer import create_splats_with_optimizers, Config, Parser, Dataset, Runner
-from gsplat.utils import load_ply, save_ply
+from gsplat.utils import load_ply, load_ply_milo
 
 class GaussianModel:
     def __init__(self, config, device):
@@ -89,20 +90,50 @@ class GaussianModel:
 
     def load_splats_from_ply(self, path: str):
         """
-        Loads splats from a .ply file and replaces the current model parameters.
-        This invalidates and recreates the optimizers.
+        Loads splats from a .ply file, pads SH coefficients to match model config,
+        and replaces the current model parameters. This invalidates and recreates 
+        the optimizers.
         """
         # 1. Load the raw data from the .ply file into a dictionary of tensors
         loaded_splats_dict = load_ply(path, device="cuda")
 
-        # 2. Create a new ParameterDict from the loaded data
-        # This ensures the model uses the new tensors as learnable parameters
+        # --- NEW: Check and Pad Spherical Harmonics ---
+        sh0 = loaded_splats_dict.get("sh0")
+        shN = loaded_splats_dict.get("shN")
+        
+        # Get the desired sh_degree from your configuration.
+        # We default to 3 if it's not specified in self.config.
+        sh_degree = getattr(self.config, 'sh_degree', 3) 
+
+        if sh0 is not None and shN is not None:
+            # The total number of SH coefficients needed is (sh_degree + 1)^2.
+            # We subtract 1 because sh0 is the first coefficient.
+            desired_shN_features = (sh_degree + 1)**2 - 1
+            current_shN_features = shN.shape[1]
+
+            # If the loaded data has fewer SH coefficients than desired...
+            if current_shN_features < desired_shN_features:
+                num_points = shN.shape[0]
+                
+                # Calculate the number of missing feature dimensions
+                num_features_to_pad = desired_shN_features - current_shN_features
+                
+                print(f"INFO: Padding SH coefficients to support sh_degree={sh_degree}. "
+                    f"Adding {num_features_to_pad} zeroed features to 'shN'.")
+
+                # Create a tensor of zeros with the correct shape for padding
+                padding_shape = (num_points, num_features_to_pad, 3)
+                padding = torch.zeros(padding_shape, dtype=shN.dtype, device=shN.device)
+                
+                # Concatenate the existing shN with the zero padding
+                loaded_splats_dict["shN"] = torch.cat([shN, padding], dim=1)
+        
+        # 3. Create a new ParameterDict from the (now padded) data
         self.splats = torch.nn.ParameterDict(
             {k: torch.nn.Parameter(v) for k, v in loaded_splats_dict.items()}
         ).to("cuda")
 
-        # 3. Re-create the optimizers
-        # The old optimizers were tied to the old parameter tensors and are now invalid.
+        # 4. Re-create the optimizers
         print("Splat parameters have been replaced. Re-initializing optimizers...")
         self._recreate_optimizers()
 
@@ -145,8 +176,10 @@ def save_rendered_image(
 if __name__ == '__main__':
 
     parser = argparse.ArgumentParser()
-    parser.add_argument('--ply_path', type=str, default="/home/te/projects/InnovationDepot/up_mid_down_video/milo_output_superpoint/point_cloud/iteration_18000/point_cloud.ply", required=False, help='Path to the .ply file to load splats from')
-    parser.add_argument("--data_dir", type=str, default="/home/te/projects/InnovationDepot/up_mid_down_video", help="Path to the dataset directory")
+    # parser.add_argument('--ply_path', type=str, default="/home/te/projects/InnovationDepot/up_mid_down_video/milo_output_superpoint/point_cloud/iteration_18000/point_cloud.ply", required=False, help='Path to the .ply file to load splats from')
+    # parser.add_argument("--data_dir", type=str, default="/home/te/projects/InnovationDepot/up_mid_down_video", help="Path to the dataset directory")
+    parser.add_argument('--ply_path', type=str, default="/home/te/projects/InnovationDepot/hloc_output_disk/gsplat_output_dapda_geometric1/ply/point_cloud_6999.ply", required=False, help='Path to the .ply file to load splats from')
+    parser.add_argument("--data_dir", type=str, default="/home/te/projects/InnovationDepot/hloc_output_disk/", help="Path to the dataset directory")
     args = parser.parse_args()
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -184,10 +217,16 @@ if __name__ == '__main__':
 
     # Now, load the saved splats into our model instance
     model.load_splats_from_ply(args.ply_path)
+    print("\nModel state after loading:")
+    print(f"Number of loaded splats: {model.splats['means'].shape[0]}")
+    print(f"Optimizers are ready: {'Yes' if model.optimizers else 'No'}")
     
 
     world_rank, world_size = 0, 1 
     runner = Runner(local_rank=0, world_rank=world_rank, world_size=world_size, cfg=cfg)
+
+    runner.splats = model.splats
+    runner.optimizers = model.optimizers
 
     print("Runner generated")
 
@@ -238,8 +277,11 @@ if __name__ == '__main__':
         "output/rendered_image1.png"
     )
 
-    # The model now contains the data from 'dummy_splats.ply'
-    # and has freshly initialized optimizers ready for training.
-    print("\nModel state after loading:")
-    print(f"Number of loaded splats: {model.splats['means'].shape[0]}")
-    print(f"Optimizers are ready: {'Yes' if model.optimizers else 'No'}")
+    for i in range(200):
+        paused = True
+        if i == 100:
+            paused = False
+        while paused:
+            time.sleep(0.1)
+        print(f"Step {i+1}/200")
+        time.sleep(0.1)
