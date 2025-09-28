@@ -201,7 +201,7 @@ class Config:
     normal_lambda: float = 0.1
     start_normal_loss_step: int = 5000
 
-    depth_normal_loss: bool = True
+    depth_normal_loss: bool = False
     lambda_depth_smooth = 0.1        # Depth smoothness weight
     lambda_normal_consistency = 0.01  # Normal consistency weight  
     depth_normal_start_step = 3000    # When to start applying
@@ -739,18 +739,10 @@ class Runner:
                 valid_mask = ((pixel_coords[..., 0] >= 0) & (pixel_coords[..., 0] < width) &
                   (pixel_coords[..., 1] >= 0) & (pixel_coords[..., 1] < height))
 
-                # valid_points = info["means2d"][:, valid_mask]  # [1, N, 2]
-
                 normals = data["normal"].to(device)
 
-                # sampled_normals = sample_normals_from_map(info["means2d"], normals, data["normal"].shape[1], data["normal"].shape[2])
                 sampled_normals = sample_normals_from_map(info["means2d"][:, valid_mask], normals, data["normal"].shape[1], data["normal"].shape[2])
-                # print("Sampled normals shape ", sampled_normals.shape)
-                # create_normal_map_from_gaussians(info["means2d"], sampled_normals, data["normal"].shape[1], data["normal"].shape[2])
-
-                # gaussian_normals, confidence = calculate_gaussian_splat_normal_adaptive(self.splats["quats"], torch.exp(self.splats["scales"]), self.splats["opacities"])
                 gaussian_normals, confidence = calculate_gaussian_splat_normal_differentiable(self.splats["quats"], torch.exp(self.splats["scales"]), self.splats["opacities"])
-                # print("Gaussian normals shape ", gaussian_normals.shape)
                 gaussian_normals = gaussian_normals[:, valid_mask]
 
             if renders.shape[-1] == 4:
@@ -792,18 +784,7 @@ class Runner:
             loss = l1loss * (1.0 - cfg.ssim_lambda) + ssimloss * cfg.ssim_lambda
 
             if cfg.load_normals and step >= cfg.start_normal_loss_step:
-
-                # sampled_normals = F.normalize(sampled_normals, dim=-1)
-                # gaussian_normals = F.normalize(gaussian_normals, dim=-1)
-
-                # normal_loss = F.l1_loss(gaussian_normals, sampled_normals)
-                # normal_loss = (1.0 - F.cosine_similarity(gaussian_normals, sampled_normals, dim=-1)).mean()
-                # loss += cfg.normal_lambda * normal_loss
-
-                # normal_loss = compute_progressive_normal_loss(gaussian_normals, sampled_normals, info["means2d"], step, 30000, confidence)
                 normal_loss = compute_progressive_normal_loss(gaussian_normals, sampled_normals, info["means2d"][:, valid_mask], step, 30000, confidence)
-                # consistency_loss = apply_surface_consistency_loss(gaussian_normals.squeeze(0), self.splats["means"], weight=0.3)
-                # spatial_smoothness_loss = add_spatial_smoothness_loss(gaussian_normals, info["means2d"][:, valid_mask], self.splats["means"][valid_mask], k_neighbors=2)
                 loss += cfg.normal_lambda * (normal_loss)
 
             if cfg.depth_loss:
