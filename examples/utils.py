@@ -739,6 +739,50 @@ def calculate_gaussian_splat_normal_differentiable(rotation_matrix, scale_matrix
 
 # =======
 
+def contrastive_segmentation_loss(identity_map, instance_mask):
+    """
+    Computes a contrastive loss to train identity vectors for segmentation.
+    Args:
+        identity_map (Tensor): Rendered identity features of shape [H, W, D].
+        instance_mask (Tensor): Ground truth instance mask of shape [H, W].
+    """
+    loss = 0.0
+    
+    # Get unique domino IDs present in the mask (ignore 0, which is background)
+    instance_ids = torch.unique(instance_mask)
+    instance_ids = instance_ids[instance_ids != 0]
+
+    if len(instance_ids) < 2:
+        # Not enough instances in this view to compute a contrastive loss
+        return torch.tensor(0.0, device=identity_map.device, requires_grad=True)
+
+    # Calculate mean feature vector (prototype) for each instance
+    prototypes = []
+    intra_loss = 0.0
+    for i in instance_ids:
+        mask_i = (instance_mask == i)
+        if mask_i.sum() == 0: continue # Skip if instance not in view
+
+        features_i = identity_map[mask_i] # [num_pixels_i, D]
+        prototype_i = features_i.mean(dim=0)
+        prototypes.append(prototype_i)
+
+        # L_intra: encourages features within an instance to be close to their prototype
+        intra_loss += torch.nn.functional.mse_loss(features_i, prototype_i.unsqueeze(0))
+
+    prototypes = torch.stack(prototypes) # [num_instances, D]
+    
+    # L_inter: encourages prototypes of different instances to be far apart
+    # We use cosine similarity: loss is high when vectors are similar (sim -> 1)
+    # and low when they are dissimilar (sim -> -1).
+    cosine_sim = torch.nn.functional.cosine_similarity(prototypes.unsqueeze(1), prototypes.unsqueeze(0), dim=-1)
+    
+    # We want off-diagonal elements to be small. Add 1 to make the target 0.
+    inter_loss = (cosine_sim - torch.eye(len(instance_ids), device=cosine_sim.device) + 1).pow(2).mean()
+
+    loss = intra_loss / len(instance_ids) + inter_loss
+    return loss
+
 
 def generate_image_from_normals(sampled_normals, means2d, image_height, image_width, 
                                rendering_mode='shaded', light_dir=None, colors=None,

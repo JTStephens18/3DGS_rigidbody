@@ -63,14 +63,14 @@ class Parser:
         normalize: bool = False,
         test_every: int = 8,
         load_normals: bool = False,
-        load_identity_masks: bool = False,
+        load_instance_masks: bool = False,
     ):
         self.data_dir = data_dir
         self.factor = factor
         self.normalize = normalize
         self.test_every = test_every
         self.load_normals = load_normals
-        self.load_identity_masks = load_identity_masks
+        self.load_instance_masks = load_instance_masks
 
         colmap_dir = os.path.join(data_dir, "sparse/0/")
         if not os.path.exists(colmap_dir):
@@ -495,21 +495,21 @@ class Dataset:
         if mask is not None:
             data["mask"] = torch.from_numpy(mask).bool()
 
-        if self.parser.load_identity_masks:
-            # Should be a size of [B, H, W] with integer values > 0 indicating instance ids
+        if self.parser.load_instance_masks:
+            # Should be a size of [H, W] with integer values > 0 indicating instance ids
             identity_encodings = os.path.join(
                 self.parser.data_dir, 
                 "masks/instance_ids_npy", 
                 os.path.splitext(os.path.basename(self.parser.image_paths[index]))[0] + "_instance_id.npy"
             )
             if os.path.exists(identity_encodings):
-                identity_mask = np.load(identity_encodings)
+                instance_mask = np.load(identity_encodings)
                 if self.patch_size is not None:
-                    identity_mask = identity_mask[y : y + self.patch_size, x : x + self.patch_size]
-                data["identity_mask"] = torch.from_numpy(identity_mask).long()
+                    instance_mask = instance_mask[y : y + self.patch_size, x : x + self.patch_size]
+                data["instance_mask"] = torch.from_numpy(instance_mask).long()
             else:
                 print(f"Warning: Identity mask {identity_encodings} not found.")
-                data["identity_mask"] = torch.zeros(image.shape[:2], dtype=torch.long)
+                data["instance_mask"] = torch.zeros(image.shape[:2], dtype=torch.long)
 
         if self.load_depths:
             # projected points to image plane to get depths

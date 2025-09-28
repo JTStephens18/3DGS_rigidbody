@@ -42,3 +42,8 @@ The end-to-end pipeline follows these steps:
     * Write a simulation loop that uses Warp to update each object's state.
     * Apply the calculated transformations to the underlying Gaussians.
     * Apply an initial "push" to the first object and run the simulation, rendering each frame.
+
+
+### ToDo:
+* Cleanup and reimplement normal loss calculation 
+    * Cleanup examples/utils.py and remove unused and redundant functions 

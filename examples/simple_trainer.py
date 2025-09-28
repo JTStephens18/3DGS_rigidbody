@@ -28,7 +28,7 @@ from torch.utils.tensorboard import SummaryWriter
 from torchmetrics.image import PeakSignalNoiseRatio, StructuralSimilarityIndexMeasure
 from torchmetrics.image.lpip import LearnedPerceptualImagePatchSimilarity
 from typing_extensions import Literal, assert_never
-from utils import AppearanceOptModule, CameraOptModule, knn, rgb_to_sh, set_random_seed, sample_normals_from_map, calculate_gaussian_splat_normal, generate_image_from_normals_batch, save_image_tensor, render_normals_simple, calculate_gaussian_splat_normal_adaptive, compute_progressive_normal_loss, apply_surface_consistency_loss, save_disparity_image, calculate_gaussian_splat_normal_differentiable, add_simplified_depth_normal_loss, render_normals_with_interpolation
+from utils import AppearanceOptModule, CameraOptModule, knn, rgb_to_sh, set_random_seed, sample_normals_from_map, save_image_tensor, contrastive_segmentation_loss, render_normals_simple, compute_progressive_normal_loss, apply_surface_consistency_loss, save_disparity_image, calculate_gaussian_splat_normal_differentiable, add_simplified_depth_normal_loss, render_normals_with_interpolation
 from visualize import add_depth_normal_visualization_to_training_loop
 
 from gsplat import export_splats
@@ -193,8 +193,19 @@ class Config:
     # Whether to use Dash Gaussian Implementation
     dash_gaussian: bool = False
 
+    # Enable instance segmentation training
+    with_segmentation: bool = True
+    # Dimension of the learnable identity vector
+    identity_dim: int = 16
+    # Learning rate for the identity vectors and MLP
+    identity_lr: float = 1.6e-3
+    # Weight for the segmentation loss
+    segmentation_lambda: float = 0.1
+    # Start segmentation training after this many steps
+    segmentation_start_iter: int = 1000
+
     # Whether to use segmentation masks for clustering
-    load_identity_masks: bool = False
+    load_instance_masks: bool = False
 
     # Whether to use normal maps
     load_normals: bool = False
@@ -245,6 +256,9 @@ def create_splats_with_optimizers(
     quats_lr: float = 1e-3,
     sh0_lr: float = 2.5e-3,
     shN_lr: float = 2.5e-3 / 20,
+    with_segmentation: bool = False,
+    identity_lr: float = 1.6e-3,
+    identity_dim: int = 16,
     scene_scale: float = 1.0,
     sh_degree: int = 3,
     sparse_grad: bool = False,
@@ -285,6 +299,12 @@ def create_splats_with_optimizers(
         ("quats", torch.nn.Parameter(quats), quats_lr),
         ("opacities", torch.nn.Parameter(opacities), opacities_lr),
     ]
+
+    if with_segmentation:
+        identity_encodings = torch.randn(N, identity_dim)
+        params.append(
+            ("identity_encodings", torch.nn.Parameter(identity_encodings), identity_lr)
+        )
 
     if feature_dim is None:
         # color is SH coefficients.
@@ -361,7 +381,7 @@ class Runner:
             normalize=cfg.normalize_world_space,
             test_every=cfg.test_every,
             load_normals=cfg.load_normals,
-            load_identity_masks=cfg.load_identity_masks,
+            load_instance_masks=cfg.load_instance_masks,
         )
         self.trainset = Dataset(
             self.parser,
@@ -389,6 +409,9 @@ class Runner:
             quats_lr=cfg.quats_lr,
             sh0_lr=cfg.sh0_lr,
             shN_lr=cfg.shN_lr,
+            with_segmentation=cfg.with_segmentation,
+            identity_lr=cfg.identity_lr,
+            identity_dim=cfg.identity_dim,
             scene_scale=self.scene_scale,
             sh_degree=cfg.sh_degree,
             sparse_grad=cfg.sparse_grad,
@@ -400,6 +423,21 @@ class Runner:
             world_size=world_size,
         )
         print("Model initialized. Number of GS:", len(self.splats["means"]))
+
+        # --- Create Segmentation Head and add to optimizer ---
+        self.seg_head_optimizer = None # Initialize to None
+        if cfg.with_segmentation:
+            self.segmentation_head = torch.nn.Sequential(
+                torch.nn.Linear(cfg.identity_dim, 64),
+                torch.nn.ReLU(),
+                torch.nn.Linear(64, cfg.identity_dim),
+            ).to(self.device)
+            
+            # Create a NEW, SEPARATE optimizer for the MLP
+            # This is NOT added to self.optimizers, so gsplat's strategy won't see it
+            self.seg_head_optimizer = torch.optim.Adam(
+                self.segmentation_head.parameters(), lr=cfg.identity_lr
+            )
 
         # Densification Strategy
         self.cfg.strategy.check_sanity(self.splats, self.optimizers)
@@ -515,6 +553,7 @@ class Runner:
         masks: Optional[Tensor] = None,
         rasterize_mode: Optional[Literal["classic", "antialiased"]] = None,
         camera_model: Optional[Literal["pinhole", "ortho", "fisheye"]] = None,
+        override_features: Optional[Tensor] = None,
         **kwargs,
     ) -> Tuple[Tensor, Tensor, Dict]:
         means = self.splats["means"]  # [N, 3]
@@ -524,8 +563,14 @@ class Runner:
         scales = torch.exp(self.splats["scales"])  # [N, 3]
         opacities = torch.sigmoid(self.splats["opacities"])  # [N,]
 
+        if override_features is not None:
+            colors = override_features
+
         image_ids = kwargs.pop("image_ids", None)
-        if self.cfg.app_opt:
+        # Override features is used to render identity features instead of colors
+        if override_features is not None:
+            colors = override_features
+        elif self.cfg.app_opt:
             colors = self.app_module(
                 features=self.splats["features"],
                 embed_ids=image_ids,
@@ -647,6 +692,9 @@ class Runner:
             camtoworlds = camtoworlds_gt = data["camtoworld"].to(device)  # [1, 4, 4]
             Ks = data["K"].to(device)  # [1, 3, 3]
             pixels = data["image"].to(device) / 255.0  # [1, H, W, 3]
+
+            instance_mask = data["instance_mask"].to(device) if cfg.with_segmentation and "instance_mask" in data else None
+
             num_train_rays_per_step = (
                 pixels.shape[0] * pixels.shape[1] * pixels.shape[2]
             )
@@ -855,6 +903,28 @@ class Runner:
 
             # ====== End of depth normal loss ======
 
+            # --- Segmentation Rendering and Loss ---
+            loss_seg = torch.tensor(0.0, device=device)
+            if cfg.with_segmentation and step >= cfg.segmentation_start_iter and instance_mask is not None:
+                # Process identity vectors through the MLP
+                raw_identities = self.splats["identity_encodings"]
+                processed_identities = self.segmentation_head(raw_identities)
+
+                # Render the identity features
+                identity_map, _, _ = self.rasterize_splats(
+                    camtoworlds=camtoworlds,
+                    Ks=Ks,
+                    width=width,
+                    height=height,
+                    override_features=processed_identities, # Use our new argument
+                    sh_degree=-1, # Ensure features are not treated as SH
+                    # ... (other essential rendering args)
+                )
+
+                # Calculate the segmentation loss (assuming batch size of 1)
+                loss_seg = contrastive_segmentation_loss(identity_map[0], instance_mask[0])
+                loss += cfg.segmentation_lambda * loss_seg
+
             if cfg.use_bilateral_grid:
                 tvloss = 10 * total_variation_loss(self.bil_grids.grids)
                 loss += tvloss
@@ -900,6 +970,8 @@ class Runner:
                 self.writer.add_scalar("train/mem", mem, step)
                 if cfg.depth_loss:
                     self.writer.add_scalar("train/depthloss", depthloss.item(), step)
+                if cfg.with_segmentation and step >= cfg.segmentation_start_iter:
+                    self.writer.add_scalar("train/seg_loss", loss_seg.item(), step)
                 if cfg.use_bilateral_grid:
                     self.writer.add_scalar("train/tvloss", tvloss.item(), step)
                 if cfg.tb_save_image:
@@ -1027,6 +1099,9 @@ class Runner:
                 else:
                     optimizer.step()
                 optimizer.zero_grad(set_to_none=True)
+            if self.seg_head_optimizer is not None:
+                self.seg_head_optimizer.step()
+                self.seg_head_optimizer.zero_grad(set_to_none=True)
             for optimizer in self.pose_optimizers:
                 optimizer.step()
                 optimizer.zero_grad(set_to_none=True)
