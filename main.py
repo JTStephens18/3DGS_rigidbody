@@ -8,13 +8,13 @@ import numpy as np
 import torch 
 import torchvision.utils
 from torch import Tensor
-from typing import Optional
+from typing import Optional, Dict
 import warnings
 import argparse
 import time
 
 from examples.simple_trainer import create_splats_with_optimizers, Config, Parser, Dataset, Runner
-from gsplat.utils import load_ply, load_ply_milo
+from gsplat.utils import load_ply, load_ply_milo, normalized_quat_to_rotmat
 
 class GaussianModel:
     def __init__(self, config, device):
@@ -170,7 +170,62 @@ def save_rendered_image(
     torchvision.utils.save_image(image_tensor_chw, filepath)
     print(f"✅ Rendered image saved to {filepath}")
 
+def quat_multiply(q1: Tensor, q2: Tensor) -> Tensor:
+    """Multiply two quaternions (w, x, y, z)."""
+    w1, x1, y1, z1 = q1.unbind(-1)
+    w2, x2, y2, z2 = q2.unbind(-1)
+    w = w1 * w2 - x1 * x2 - y1 * y2 - z1 * z2
+    x = w1 * x2 + x1 * w2 + y1 * z2 - z1 * y2
+    y = w1 * y2 - x1 * z2 + y1 * w2 + z1 * x2
+    z = w1 * z2 + x1 * y2 - y1 * x2 + z1 * w2
+    return torch.stack((w, x, y, z), -1)
 
+def apply_transform(
+    splats: Dict[str, Tensor], 
+    translation: Tensor, 
+    rotation_quat: Tensor
+):
+    """
+    Applies a rigid transformation to a set of Gaussians.
+    
+    Args:
+        splats (Dict[str, Tensor]): The original Gaussian parameters.
+        translation (Tensor): A (3,) tensor for the translation.
+        rotation_quat (Tensor): A (4,) tensor for the rotation (wxyz).
+
+    Returns:
+        Dict[str, Tensor]: The new, transformed Gaussian parameters.
+    """
+    # Create a copy to avoid modifying the original data
+    transformed_splats = {k: v.clone() for k, v in splats.items()}
+    
+    means = transformed_splats["means"]
+    quats = transformed_splats["quats"] # Assuming (w, x, y, z) format
+
+    # --- 1. Apply Rotation ---
+    # The gsplat rasterizer normalizes quaternions internally, but it's good practice
+    rotation_quat = rotation_quat / torch.linalg.norm(rotation_quat)
+
+    # Rotate the positions (means) of the Gaussians around their collective center
+    center = means.mean(dim=0)
+    rot_mat = normalized_quat_to_rotmat(rotation_quat.unsqueeze(0)).squeeze(0)
+    
+    transformed_means = torch.matmul(means - center, rot_mat.T) + center
+    
+    # Compose the new rotation with the existing rotations of the Gaussians
+    # Note: gsplat uses wxyz, so ensure your source quats are in that format
+    # The 'quats' from load_ply might be xyzw, so you may need to roll them.
+    # Example: quats = quats[:, [3, 0, 1, 2]] # Convert xyzw to wxyz
+    transformed_quats = quat_multiply(rotation_quat.expand_as(quats), quats)
+    
+    # --- 2. Apply Translation ---
+    transformed_means += translation
+
+    # --- 3. Update the dictionary ---
+    transformed_splats["means"] = transformed_means
+    transformed_splats["quats"] = transformed_quats
+    
+    return transformed_splats
 
 # --- Example of how to use the class ---
 if __name__ == '__main__':
@@ -255,8 +310,6 @@ if __name__ == '__main__':
     render_mode="RGB",
     masks = data["mask"].to(device) if "mask" in data else None  # [1, H, W]
 
-    print("Starting rasterization")
-
     renders, alphas, info = runner.rasterize_splats(
         camtoworlds=camtoworlds,
         Ks=Ks,
@@ -270,12 +323,10 @@ if __name__ == '__main__':
         masks=masks,
     )
 
-    print("Rasterization complete")
-
-    save_rendered_image(
-        renders,
-        "output/rendered_image1.png"
-    )
+    # save_rendered_image(
+    #     renders,
+    #     "output/rendered_image1.png"
+    # )
 
     for i in range(200):
         paused = True
@@ -285,3 +336,57 @@ if __name__ == '__main__':
             time.sleep(0.1)
         print(f"Step {i+1}/200")
         time.sleep(0.1)
+
+    # Store the original splats to use as a base for each frame's transformation
+    # original_splats = {k: v.clone().detach() for k, v in runner.splats.items()}
+
+    # num_frames = 60  # How many frames to render
+    # output_dir = "output/animation"
+    # os.makedirs(output_dir, exist_ok=True)
+
+    # print(f"🚀 Starting animation loop for {num_frames} frames...")
+
+    # for frame in range(num_frames):
+    #     tic = time.time()
+        
+    #     # --- a. Calculate the transformation for this frame ---
+    #     # Simple example: Move along the X-axis and rotate around the Z-axis
+    #     progress = frame / (num_frames - 1) # Goes from 0.0 to 1.0
+        
+    #     # Translation: moves from [0,0,0] to [1,0,0]
+    #     translation = torch.tensor([progress * 1.0, 0.0, 0.0], device=device)
+        
+    #     # Rotation: rotates 360 degrees (2*pi radians) around the Z-axis
+    #     angle = torch.tensor(progress * 2.0 * torch.pi).to(device)
+    #     axis = torch.tensor([0.0, 0.0, 1.0], device=device)
+        
+    #     # Convert axis-angle to quaternion (w, x, y, z)
+    #     w = torch.cos(angle / 2.0)
+    #     sin_half_angle = torch.sin(angle / 2.0)
+    #     xyz = axis * sin_half_angle
+    #     rotation_quat = torch.cat([w.unsqueeze(0), xyz])
+
+    #     # --- b. Apply the transformation to the original splats ---
+    #     transformed_splats = apply_transform(original_splats, translation, rotation_quat)
+        
+    #     # Temporarily assign the transformed splats to the runner for this frame
+    #     runner.splats = transformed_splats
+        
+    #     # --- c. Render the frame ---
+    #     renders, _, _ = runner.rasterize_splats(
+    #         camtoworlds=camtoworlds,
+    #         Ks=Ks,
+    #         width=width,
+    #         height=height,
+    #         sh_degree=3,
+    #         render_mode="RGB",
+    #     )
+        
+    #     # --- d. Save the output ---
+    #     filepath = os.path.join(output_dir, f"frame_{frame:04d}.png")
+    #     save_rendered_image(renders, filepath)
+        
+    #     toc = time.time()
+    #     print(f"Rendered frame {frame+1}/{num_frames} in {toc - tic:.2f}s")
+        
+    # print("\nAnimation complete!")

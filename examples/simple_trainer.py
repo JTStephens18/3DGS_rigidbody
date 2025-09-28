@@ -193,6 +193,9 @@ class Config:
     # Whether to use Dash Gaussian Implementation
     dash_gaussian: bool = False
 
+    # Whether to use segmentation masks for clustering
+    load_identity_masks: bool = False
+
     # Whether to use normal maps
     load_normals: bool = False
     normal_lambda: float = 0.1
@@ -357,7 +360,8 @@ class Runner:
             factor=cfg.data_factor,
             normalize=cfg.normalize_world_space,
             test_every=cfg.test_every,
-            load_normals=cfg.load_normals
+            load_normals=cfg.load_normals,
+            load_identity_masks=cfg.load_identity_masks,
         )
         self.trainset = Dataset(
             self.parser,
