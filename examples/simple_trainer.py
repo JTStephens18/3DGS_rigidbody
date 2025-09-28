@@ -710,7 +710,7 @@ class Runner:
                 masks=masks,
             )
 
-            if cfg.save_depth_normal_vis:
+            if cfg.save_depth_normal_vis and cfg.load_normals:
                 add_depth_normal_visualization_to_training_loop(
                     renders=renders,
                     pixels=pixels,
@@ -1060,6 +1060,8 @@ class Runner:
 
             # Run post-backward steps after backward and optimizer
             if isinstance(self.cfg.strategy, DefaultStrategy):
+                print("Params ", self.splats)
+                print("Params grads ", {k: v.grad for k, v in self.splats.items()})
                 self.cfg.strategy.step_post_backward(
                     params=self.splats,
                     optimizers=self.optimizers,
