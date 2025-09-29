@@ -208,9 +208,7 @@ def main(primary_input_folder: str,
          secondary_npy_output_folder: Optional[str],
          reference_crop_file: Optional[str]):
     if reference_crop_file:
-        # target_w, target_h = get_size_from_reference(reference_crop_file)
-        target_w = 400
-        target_h = 720
+        target_w, target_h = get_size_from_reference(reference_crop_file)
     else:
         target_w, target_h = analyze_primary_for_uniform_size(primary_input_folder)
         print(f"Calculated uniform crop size from primary dataset: width={target_w}, height={target_h}")
