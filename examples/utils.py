@@ -739,6 +739,8 @@ def calculate_gaussian_splat_normal_differentiable(rotation_matrix, scale_matrix
 
 # =======
 
+# ========= Segmentation Utils =======
+
 def contrastive_segmentation_loss(identity_map, instance_mask):
     """
     Computes a contrastive loss to train identity vectors for segmentation.
@@ -782,6 +784,45 @@ def contrastive_segmentation_loss(identity_map, instance_mask):
 
     loss = intra_loss / len(instance_ids) + inter_loss
     return loss
+
+
+def log_cluster_quality(identity_map, instance_mask, writer, step):
+    """Calculates and logs intra- and inter-cluster distances."""
+    with torch.no_grad():
+        # Get unique object IDs present in the current view (ignore background 0)
+        object_ids = [i for i in torch.unique(instance_mask) if i != 0]
+
+        if len(object_ids) < 2:
+            return # Not enough objects in view to compare
+
+        # Calculate the centroid (mean encoding) for each object
+        centroids = {}
+        for obj_id in object_ids:
+            mask = (instance_mask == obj_id)
+            object_features = identity_map[mask]
+            if len(object_features) > 0:
+                centroids[obj_id.item()] = torch.mean(object_features, dim=0)
+
+        # Calculate intra-cluster distances (compactness)
+        total_intra_dist = 0
+        for obj_id in object_ids:
+            mask = (instance_mask == obj_id)
+            object_features = identity_map[mask]
+            if obj_id.item() in centroids and len(object_features) > 0:
+                # L2 distance from each point to its centroid
+                dist = torch.norm(object_features - centroids[obj_id.item()], dim=1)
+                total_intra_dist += torch.mean(dist)
+        
+        avg_intra_dist = total_intra_dist / len(centroids)
+        writer.add_scalar("quality/intra_cluster_distance", avg_intra_dist.item(), step)
+
+        # Calculate inter-cluster distances (separation)
+        if len(centroids) > 1:
+            centroid_tensors = torch.stack(list(centroids.values()))
+            # Calculate pairwise distance between all centroids
+            inter_dist_matrix = torch.pdist(centroid_tensors)
+            avg_inter_dist = torch.mean(inter_dist_matrix)
+            writer.add_scalar("quality/inter_cluster_distance", avg_inter_dist.item(), step)
 
 
 def cgc_contrastive_clustering_loss(
@@ -889,6 +930,9 @@ def cgc_spatial_regularizer(
     loss_far = (far_sims**2).mean()
 
     return lambda_near * loss_near + lambda_far * loss_far
+
+
+# ========= Segmentation Utils End =======
 
 
 def generate_image_from_normals(sampled_normals, means2d, image_height, image_width, 

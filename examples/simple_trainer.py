@@ -28,7 +28,7 @@ from torch.utils.tensorboard import SummaryWriter
 from torchmetrics.image import PeakSignalNoiseRatio, StructuralSimilarityIndexMeasure
 from torchmetrics.image.lpip import LearnedPerceptualImagePatchSimilarity
 from typing_extensions import Literal, assert_never
-from utils import AppearanceOptModule, CameraOptModule, knn, rgb_to_sh, set_random_seed, sample_normals_from_map, save_image_tensor, contrastive_segmentation_loss, cgc_spatial_regularizer, cgc_contrastive_clustering_loss, render_normals_simple, compute_progressive_normal_loss, apply_surface_consistency_loss, save_disparity_image, calculate_gaussian_splat_normal_differentiable, add_simplified_depth_normal_loss, render_normals_with_interpolation
+from utils import AppearanceOptModule, CameraOptModule, knn, rgb_to_sh, set_random_seed, sample_normals_from_map, save_image_tensor, contrastive_segmentation_loss, log_cluster_quality, cgc_spatial_regularizer, cgc_contrastive_clustering_loss, render_normals_simple, compute_progressive_normal_loss, apply_surface_consistency_loss, save_disparity_image, calculate_gaussian_splat_normal_differentiable, add_simplified_depth_normal_loss, render_normals_with_interpolation
 from visualize import add_depth_normal_visualization_to_training_loop
 
 from gsplat import export_splats
@@ -1019,6 +1019,7 @@ class Runner:
                     self.writer.add_scalar("train/depthloss", depthloss.item(), step)
                 if cfg.with_segmentation and step >= cfg.segmentation_start_iter:
                     self.writer.add_scalar("train/seg_loss", loss_seg.item(), step)
+                    log_cluster_quality(identity_map, instance_mask, self.writer, step)
                     # self.writer.add_scalar("train/seg_cgc", loss_cgc.item(), step)
                     # self.writer.add_scalar("train/seg_reg", loss_reg.item(), step)
                 if cfg.use_bilateral_grid:

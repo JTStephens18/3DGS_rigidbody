@@ -3,7 +3,10 @@ import numpy as np
 from pathlib import Path
 import yaml
 from sklearn.cluster import DBSCAN, KMeans
+from sklearn.manifold import TSNE
 from scipy.spatial.distance import cdist
+import matplotlib.pyplot as plt
+
 from collections import Counter
 import argparse
 
@@ -225,6 +228,20 @@ def kmeans_identity_encodings(identity_map, instance_mask, identity_encodings):
     kmeans_centroids = kmeans.cluster_centers_
 
     print("✅ K-Means clustering complete.")
+
+    print("Running t-SNE for 2D visualization (this may take a moment)...")
+    tsne = TSNE(n_components=2, verbose=1, perplexity=40, n_iter=300, random_state=42)
+    tsne_results = tsne.fit_transform(all_features)
+
+    plt.figure(figsize=(10, 8))
+    scatter = plt.scatter(tsne_results[:,0], tsne_results[:,1], c=labels, cmap='viridis', alpha=0.5, s=5)
+    plt.legend(handles=scatter.legend_elements()[0], labels=['Cluster 0', 'Cluster 1', 'Cluster 2'])
+    plt.title('t-SNE Visualization of Identity Encodings')
+    plt.xlabel('t-SNE Component 1')
+    plt.ylabel('t-SNE Component 2')
+    plt.grid(True)
+    plt.savefig("tsne_visualization.png")
+    print("Saved t-SNE plot to tsne_visualization.png")
 
     # Get your anchor vectors and their corresponding object IDs
     anchor_ids = list(anchor_encodings.keys())
