@@ -784,6 +784,113 @@ def contrastive_segmentation_loss(identity_map, instance_mask):
     return loss
 
 
+def cgc_contrastive_clustering_loss(
+    feature_map: torch.Tensor,   # [H, W, D], rendered per-pixel features (after projector)
+    instance_mask: torch.Tensor, # [H, W], SAM mask with int IDs (0=bg)
+    min_cluster_size: int = 30,  # filter out tiny masks (adapted from paper’s 100 for domino scale)
+    eps: float = 1e-6
+) -> torch.Tensor:
+    """
+    Contrastive Clustering Loss (Eq. 3 in CGC paper).
+    Each instance mask defines a cluster. For each pixel feature inside a cluster,
+    we push it toward its cluster centroid and away from other centroids.
+
+    Returns a scalar loss (float Tensor).
+    """
+
+    # Flatten
+    H, W, D = feature_map.shape
+    features = feature_map.view(-1, D)       # [HW, D]
+    masks = instance_mask.view(-1)           # [HW]
+
+    # L2 normalize features for stability (cosine similarity)
+    features = F.normalize(features, dim=-1)
+
+    unique_ids = torch.unique(masks)
+    unique_ids = unique_ids[unique_ids != 0]  # ignore background
+
+    if len(unique_ids) < 2:
+        return torch.tensor(0.0, device=feature_map.device, requires_grad=True)
+
+    centroids = []
+    cluster_feats = []
+
+    for inst_id in unique_ids:
+        idx = (masks == inst_id).nonzero(as_tuple=True)[0]
+        if idx.numel() < min_cluster_size:
+            continue
+        feats_i = features[idx]   # [Ni, D]
+        centroid = feats_i.mean(dim=0)
+        centroid = F.normalize(centroid, dim=0)
+        centroids.append(centroid)
+        cluster_feats.append(feats_i)
+
+    if len(centroids) < 2:
+        return torch.tensor(0.0, device=feature_map.device, requires_grad=True)
+
+    centroids = torch.stack(centroids, dim=0)   # [K, D]
+    loss = 0.0
+
+    for feats_i, centroid_i in zip(cluster_feats, centroids):
+        # cosine sim between each pixel feat and all centroids
+        sims = feats_i @ centroids.T   # [Ni, K]
+        # temperature φ_p = mean similarity within this cluster (paper Sec 3.2)
+        phi = (feats_i @ centroid_i).mean().clamp(min=eps)
+        logits = sims / phi
+        labels = torch.arange(len(centroids), device=feature_map.device)
+        # For this cluster, positives are centroid_i; so use cross-entropy target
+        target = torch.full((feats_i.shape[0],), labels.tolist().index(labels[centroids==centroid_i].item()), dtype=torch.long, device=feature_map.device)
+        # Actually simpler: positives are index of centroid_i
+        pos_idx = (centroids == centroid_i).all(dim=1).nonzero(as_tuple=True)[0].item()
+        targets = torch.full((feats_i.shape[0],), pos_idx, device=feature_map.device, dtype=torch.long)
+
+        loss += F.cross_entropy(logits, targets)
+
+    return loss / len(cluster_feats)
+
+
+def cgc_spatial_regularizer(
+    features: torch.Tensor,   # [N, D], per-Gaussian features
+    positions: torch.Tensor,  # [N, 3], Gaussian means
+    k_near: int = 2,
+    k_far: int = 5,
+    lambda_near: float = 0.05,
+    lambda_far: float = 0.15,
+    eps: float = 1e-6
+) -> torch.Tensor:
+    """
+    Spatial Similarity Regularization (Sec 3.3 in CGC).
+    Encourages nearby Gaussians to have similar features,
+    discourages very distant Gaussians from being too similar.
+    """
+
+    N, D = features.shape
+    if N < (k_near + k_far + 1):
+        return torch.tensor(0.0, device=features.device, requires_grad=True)
+
+    # Normalize features
+    f_norm = F.normalize(features, dim=-1)
+
+    # Compute pairwise distances in 3D (positions)
+    with torch.no_grad():
+        dist = torch.cdist(positions, positions)  # [N, N]
+        near_idx = dist.topk(k_near+1, largest=False).indices[:, 1:]   # skip self
+        far_idx = dist.topk(k_far, largest=True).indices
+
+    # Cosine similarities
+    sim = f_norm @ f_norm.T   # [N, N]
+
+    # L_near: encourage high similarity for close neighbors
+    near_sims = sim[torch.arange(N).unsqueeze(1), near_idx]  # [N, k_near]
+    loss_near = ((1 - near_sims)**2).mean()
+
+    # L_far: encourage low similarity for far neighbors
+    far_sims = sim[torch.arange(N).unsqueeze(1), far_idx]    # [N, k_far]
+    loss_far = (far_sims**2).mean()
+
+    return lambda_near * loss_near + lambda_far * loss_far
+
+
 def generate_image_from_normals(sampled_normals, means2d, image_height, image_width, 
                                rendering_mode='shaded', light_dir=None, colors=None,
                                gaussian_size=3.0, opacity=1.0):

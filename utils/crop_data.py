@@ -255,9 +255,14 @@ if __name__ == "__main__":
     else:
         print("Secondary dataset: NONE (skipping)")
 
+    # path = os.path.join("/home/te/projects/splat_rigid_body/data/masks/" "test.jpg")
+    # npy = np.load("/home/te/projects/splat_rigid_body/data/masks/instance_ids_npy/00000_instance_id.npy", allow_pickle=False)
+    # o = save_image(path, npy)
+    # print(o)
+
     try:
         main(primary_input_folder, primary_output_folder,
-             secondary_input_folder, secondary_output_folder, secondary_npy_output_folder, reference_crop_file)
+             secondary_input_folder, secondary_output_folder, secondary_npy_output_folder, reference_crop_file)  
     except SystemExit as e:
         print(f"Fatal: {e}")
         sys.exit(1)

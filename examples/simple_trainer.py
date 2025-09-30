@@ -28,7 +28,7 @@ from torch.utils.tensorboard import SummaryWriter
 from torchmetrics.image import PeakSignalNoiseRatio, StructuralSimilarityIndexMeasure
 from torchmetrics.image.lpip import LearnedPerceptualImagePatchSimilarity
 from typing_extensions import Literal, assert_never
-from utils import AppearanceOptModule, CameraOptModule, knn, rgb_to_sh, set_random_seed, sample_normals_from_map, save_image_tensor, contrastive_segmentation_loss, render_normals_simple, compute_progressive_normal_loss, apply_surface_consistency_loss, save_disparity_image, calculate_gaussian_splat_normal_differentiable, add_simplified_depth_normal_loss, render_normals_with_interpolation
+from utils import AppearanceOptModule, CameraOptModule, knn, rgb_to_sh, set_random_seed, sample_normals_from_map, save_image_tensor, contrastive_segmentation_loss, cgc_spatial_regularizer, cgc_contrastive_clustering_loss, render_normals_simple, compute_progressive_normal_loss, apply_surface_consistency_loss, save_disparity_image, calculate_gaussian_splat_normal_differentiable, add_simplified_depth_normal_loss, render_normals_with_interpolation
 from visualize import add_depth_normal_visualization_to_training_loop
 
 from gsplat import export_splats
@@ -206,6 +206,15 @@ class Config:
 
     # Whether to use segmentation masks for clustering
     load_instance_masks: bool = False
+
+    # Contrastive Gaussian Clustering params
+    cgc_iter_cc: int = 50
+    cgc_iter_reg: int = 100
+    cgc_min_cluster: int = 30
+    cgc_k_near: int = 2
+    cgc_k_far: int = 5
+    cgc_lambda_near: float = 0.05
+    cgc_lambda_far: float = 0.15
 
     # Whether to use normal maps
     load_normals: bool = False
@@ -904,6 +913,7 @@ class Runner:
             # ====== End of depth normal loss ======
 
             # --- Segmentation Rendering and Loss ---
+
             loss_seg = torch.tensor(0.0, device=device)
             if cfg.with_segmentation and step >= cfg.segmentation_start_iter and instance_mask is not None:
                 # Process identity vectors through the MLP
@@ -924,6 +934,43 @@ class Runner:
                 # Calculate the segmentation loss (assuming batch size of 1)
                 loss_seg = contrastive_segmentation_loss(identity_map[0], instance_mask[0])
                 loss += cfg.segmentation_lambda * loss_seg
+
+
+            # loss_cgc = torch.tensor(0.0, device=device)
+            # loss_reg = torch.tensor(0.0, device=device)
+
+            # if cfg.with_segmentation and step >= cfg.segmentation_start_iter and instance_mask is not None:
+            #     raw_identities = self.splats["identity_encodings"]
+            #     processed_identities = self.segmentation_head(raw_identities)
+
+            #     # Render the per-pixel feature map
+            #     feat_map, _, _ = self.rasterize_splats(
+            #         camtoworlds=camtoworlds,
+            #         Ks=Ks,
+            #         width=width,
+            #         height=height,
+            #         override_features=processed_identities,
+            #         sh_degree=-1,
+            #     )
+
+            #     # Contrastive clustering loss (apply every N steps, e.g. 50)
+            #     if step % cfg.cgc_iter_cc == 0:
+            #         loss_cgc = cgc_contrastive_clustering_loss(
+            #             feat_map[0], instance_mask[0],
+            #             min_cluster_size=cfg.cgc_min_cluster
+            #         )
+            #         loss += cfg.segmentation_lambda * loss_cgc
+
+            #     # Spatial reg (apply every M steps, e.g. 100)
+            #     if step % cfg.cgc_iter_reg == 0:
+            #         loss_reg = cgc_spatial_regularizer(
+            #             processed_identities, self.splats["means"],
+            #             k_near=cfg.cgc_k_near, k_far=cfg.cgc_k_far,
+            #             lambda_near=cfg.cgc_lambda_near, lambda_far=cfg.cgc_lambda_far
+            #         )
+            #         loss += loss_reg
+
+            # --- End of Segmentation Loss ---
 
             if cfg.use_bilateral_grid:
                 tvloss = 10 * total_variation_loss(self.bil_grids.grids)
@@ -972,6 +1019,8 @@ class Runner:
                     self.writer.add_scalar("train/depthloss", depthloss.item(), step)
                 if cfg.with_segmentation and step >= cfg.segmentation_start_iter:
                     self.writer.add_scalar("train/seg_loss", loss_seg.item(), step)
+                    # self.writer.add_scalar("train/seg_cgc", loss_cgc.item(), step)
+                    # self.writer.add_scalar("train/seg_reg", loss_reg.item(), step)
                 if cfg.use_bilateral_grid:
                     self.writer.add_scalar("train/tvloss", tvloss.item(), step)
                 if cfg.tb_save_image:
@@ -1005,9 +1054,48 @@ class Runner:
                         data["app_module"] = self.app_module.module.state_dict()
                     else:
                         data["app_module"] = self.app_module.state_dict()
+                if cfg.with_segmentation:
+                    data["segmentation_head"] = self.segmentation_head.state_dict()
                 torch.save(
                     data, f"{self.ckpt_dir}/ckpt_{step}_rank{self.world_rank}.pt"
                 )
+
+                # ------------------------------------------------------------------ #
+                # ------------ ADDED CODE BLOCK TO SAVE IDENTITY MAP --------------- #
+                # ------------------------------------------------------------------ #
+                if cfg.with_segmentation and world_rank == 0 and step >= cfg.segmentation_start_iter:
+                    print("Saving identity map for clustering...")
+                    
+                    identity_map_dir = f"{cfg.result_dir}/identity_maps"
+                    os.makedirs(identity_map_dir, exist_ok=True)
+
+                    with torch.no_grad():
+                        # Use the first validation image for a consistent viewpoint
+                        val_data = self.valset[0]
+                        camtoworlds_val = val_data["camtoworld"].to(device).unsqueeze(0)
+                        Ks_val = val_data["K"].to(device).unsqueeze(0)
+                        height_val, width_val = val_data["image"].shape[0:2]
+
+                        processed_identities_val = self.segmentation_head(self.splats["identity_encodings"])
+
+                        identity_map_val, _, _ = self.rasterize_splats(
+                            camtoworlds=camtoworlds_val,
+                            Ks=Ks_val,
+                            width=width_val,
+                            height=height_val,
+                            override_features=processed_identities_val,
+                            sh_degree=-1,
+                        )
+                        
+                        identity_map_np = identity_map_val.squeeze(0).cpu().numpy()
+                        # Note: step is 0-indexed, so we add 1 for a 1-indexed filename
+                        save_path = f"{identity_map_dir}/identity_map_step{step + 1}.npy"
+                        np.save(save_path, identity_map_np)
+                        print(f"Identity map saved to {save_path}")
+                # ------------------------------------------------------------------ #
+                # ----------------------- END OF ADDED BLOCK ----------------------- #
+                # ------------------------------------------------------------------ #
+
             if (
                 step in [i - 1 for i in cfg.ply_steps] or step == max_steps - 1
             ) and cfg.save_ply:
