@@ -205,7 +205,7 @@ class Config:
     segmentation_start_iter: int = 1000
 
     # Whether to use segmentation masks for clustering
-    load_instance_masks: bool = False
+    load_instance_masks: bool = True
 
     # Contrastive Gaussian Clustering params
     cgc_iter_cc: int = 50
@@ -927,7 +927,7 @@ class Runner:
                     width=width,
                     height=height,
                     override_features=processed_identities, # Use our new argument
-                    sh_degree=-1, # Ensure features are not treated as SH
+                    sh_degree=None, # Ensure features are not treated as SH
                     # ... (other essential rendering args)
                 )
 
@@ -950,7 +950,7 @@ class Runner:
             #         width=width,
             #         height=height,
             #         override_features=processed_identities,
-            #         sh_degree=-1,
+            #         sh_degree=None,
             #     )
 
             #     # Contrastive clustering loss (apply every N steps, e.g. 50)
@@ -1079,18 +1079,20 @@ class Runner:
                         processed_identities_val = self.segmentation_head(self.splats["identity_encodings"])
 
                         identity_map_val, _, _ = self.rasterize_splats(
-                            camtoworlds=camtoworlds_val,
-                            Ks=Ks_val,
-                            width=width_val,
-                            height=height_val,
+                            camtoworlds=camtoworlds,
+                            Ks=Ks,
+                            width=width,
+                            height=height,
                             override_features=processed_identities_val,
-                            sh_degree=-1,
+                            sh_degree=None,
                         )
                         
                         identity_map_np = identity_map_val.squeeze(0).cpu().numpy()
                         # Note: step is 0-indexed, so we add 1 for a 1-indexed filename
                         save_path = f"{identity_map_dir}/identity_map_step{step + 1}.npy"
+                        instance_mask_save_path = f"{identity_map_dir}/instance_mask_step{step + 1}.npy"
                         np.save(save_path, identity_map_np)
+                        np.save(instance_mask_save_path, val_data["instance_mask"].numpy())
                         print(f"Identity map saved to {save_path}")
                 # ------------------------------------------------------------------ #
                 # ----------------------- END OF ADDED BLOCK ----------------------- #

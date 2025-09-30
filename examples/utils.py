@@ -768,7 +768,7 @@ def contrastive_segmentation_loss(identity_map, instance_mask):
         prototypes.append(prototype_i)
 
         # L_intra: encourages features within an instance to be close to their prototype
-        intra_loss += torch.nn.functional.mse_loss(features_i, prototype_i.unsqueeze(0))
+        intra_loss += torch.nn.functional.mse_loss(features_i, prototype_i.expand_as(features_i))
 
     prototypes = torch.stack(prototypes) # [num_instances, D]
     

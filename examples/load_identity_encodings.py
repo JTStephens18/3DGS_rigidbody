@@ -3,6 +3,7 @@ import numpy as np
 from pathlib import Path
 import yaml
 from sklearn.cluster import DBSCAN, KMeans
+from scipy.spatial.distance import cdist
 from collections import Counter
 import argparse
 
@@ -206,10 +207,71 @@ def kmeans_identity_encodings(identity_map, instance_mask, identity_encodings):
         object_features = identity_map[mask]
         
         # Calculate the mean vector for this object
-        mean_feature = torch.mean(object_features, dim=0)
+        mean_feature = np.mean(object_features, axis=0)
         
-        anchor_encodings[obj_id.item()] = mean_feature.cpu().numpy()
+        anchor_encodings[obj_id.item()] = mean_feature
         print(f"  - Found anchor for Object ID {obj_id.item()}")
+
+    all_features = encodings
+    NUM_CLUSTERS = len(anchor_encodings)
+    print(f"\nRunning KMeans with {NUM_CLUSTERS} clusters")
+
+    kmeans = KMeans(n_clusters=NUM_CLUSTERS, random_state=42, n_init='auto').fit(all_features)
+
+    # These are the results from K-Means:
+    # 1. The cluster label (0, 1, or 2) assigned to each Gaussian
+    kmeans_labels = kmeans.labels_
+    # 2. The center (centroid) of each of the 3 clusters found
+    kmeans_centroids = kmeans.cluster_centers_
+
+    print("✅ K-Means clustering complete.")
+
+    # Get your anchor vectors and their corresponding object IDs
+    anchor_ids = list(anchor_encodings.keys())
+    anchor_vectors = np.array(list(anchor_encodings.values()))
+
+    # Calculate the distance between each K-Means centroid and each anchor vector
+    # This creates a distance matrix: rows are K-Means clusters, columns are your objects
+    distance_matrix = cdist(kmeans_centroids, anchor_vectors, 'euclidean')
+
+    # For each K-Means cluster, find the closest anchor object ID
+    # `argmin(axis=1)` finds the index of the minimum value in each row
+    closest_anchor_indices = np.argmin(distance_matrix, axis=1)
+
+    # Create the final mapping from the arbitrary K-Means label to your actual object ID
+    # e.g., {0: 2, 1: 3, 2: 1} means "K-Means cluster 0 is actually Object ID 2"
+    kmeans_to_object_id_map = {kmeans_label: anchor_ids[anchor_idx] for kmeans_label, anchor_idx in enumerate(closest_anchor_indices)}
+
+    print("\nMapping K-Means clusters to Object IDs:")
+    print(kmeans_to_object_id_map)
+
+    # Initialize a dictionary to hold the lists of Gaussian indices
+    # Use the real object IDs as keys
+    object_groups = {obj_id: [] for obj_id in anchor_ids}
+    object_groups["background"] = []
+
+    # Keep track of all Gaussians that get assigned to a domino
+    assigned_indices = set()
+
+    # Iterate through every Gaussian and its assigned K-Means label
+    for gaussian_idx, kmeans_label in enumerate(kmeans_labels):
+        # Look up the real object ID using our map
+        object_id = kmeans_to_object_id_map[kmeans_label]
+        
+        # Add the Gaussian's index to the correct object group
+        object_groups[object_id].append(gaussian_idx)
+        assigned_indices.add(gaussian_idx)
+
+    # Now, find all the unassigned Gaussians for the background group
+    num_total_gaussians = all_features.shape[0]
+    all_indices = set(range(num_total_gaussians))
+    background_indices = all_indices - assigned_indices
+    object_groups["background"] = list(background_indices)
+
+
+    print("\n✅ Final Object Groups Assembled!")
+    for name, group in object_groups.items():
+        print(f"  - Group '{name}': {len(group)} Gaussians")
 
 
 # Example usage
@@ -221,7 +283,7 @@ if __name__ == "__main__":
     parser.add_argument("--identity_dim", type=int, default=16, help="Identity encoding dimension")
     args = parser.parse_args()
     # Update this path to your actual checkpoint
-    CHECKPOINT_PATH = "/home/te/projects/splat_rigid_body/output/gsplat_spmax/ckpts/ckpt_29999_rank0.pt"
+    CHECKPOINT_PATH = "/home/te/projects/splat_rigid_body/output/gsplat_spmax/ckpts/ckpt_6999_rank0.pt"
     
     # Load and inspect encodings
     encodings = load_and_inspect_identity_encodings(
@@ -230,14 +292,19 @@ if __name__ == "__main__":
         # save_to_file="identity_encodings.npy"  # Optional: save to file
     )
 
-    instance_mask = np.load("/home/te/projects/splat_rigid_body/data/masks/instance_ids_npy/00000_instance_id.npy")
+    identity_map = np.load("/home/te/projects/splat_rigid_body/output/gsplat_spmax/identity_maps/identity_map_step7000.npy")
+    # print("Identity map shape ", identity_map.shape)
+    # print("Unique identity encodings in map ", np.unique(identity_map))
+    instance_mask = np.load("/home/te/projects/splat_rigid_body/output/gsplat_spmax/identity_maps/instance_mask_step7000.npy")
+    print("Instance mask shape ", instance_mask.shape)
+    print("Unique instance ids in mask ", np.unique(instance_mask))
 
     # identity_map = get_identity_map_from_checkpoint(ckpt_path=Path(CHECKPOINT_PATH),
     #                                  cfg=args,
     #                                  image_index=0)
 
     # DBSCAN_identity_encodings(encodings.numpy(), eps=0.5, min_samples=32)
-    # kmeans_identity_encodings(identity_map, instance_mask, encodings.numpy())
+    kmeans_identity_encodings(identity_map, instance_mask, encodings.numpy())
 
     
     print(f"\nReturned tensor shape: {encodings.shape}")
