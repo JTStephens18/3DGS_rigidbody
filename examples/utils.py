@@ -826,110 +826,135 @@ def log_cluster_quality(identity_map, instance_mask, writer, step):
 
 
 def cgc_contrastive_clustering_loss(
-    feature_map: torch.Tensor,   # [H, W, D], rendered per-pixel features (after projector)
+    feature_map: torch.Tensor,   # [H, W, D], rendered per-pixel features
     instance_mask: torch.Tensor, # [H, W], SAM mask with int IDs (0=bg)
-    min_cluster_size: int = 30,  # filter out tiny masks (adapted from paper’s 100 for domino scale)
+    min_cluster_size: int = 30,  # filter out tiny masks
     eps: float = 1e-6
 ) -> torch.Tensor:
     """
-    Contrastive Clustering Loss (Eq. 3 in CGC paper).
-    Each instance mask defines a cluster. For each pixel feature inside a cluster,
-    we push it toward its cluster centroid and away from other centroids.
-
-    Returns a scalar loss (float Tensor).
+    Vectorized Contrastive Clustering Loss (Eq. 3 in CGC paper).
+    This version removes all Python loops for significant speedup.
     """
-
-    # Flatten
     H, W, D = feature_map.shape
-    features = feature_map.view(-1, D)       # [HW, D]
-    masks = instance_mask.view(-1)           # [HW]
+    features = feature_map.view(-1, D)    # [HW, D]
+    masks = instance_mask.view(-1)        # [HW]
 
     # L2 normalize features for stability (cosine similarity)
     features = F.normalize(features, dim=-1)
 
-    unique_ids = torch.unique(masks)
-    unique_ids = unique_ids[unique_ids != 0]  # ignore background
+    # Get unique instance IDs and map each pixel to its cluster index
+    unique_ids, inverse_indices = torch.unique(masks, return_inverse=True)
 
-    if len(unique_ids) < 2:
-        return torch.tensor(0.0, device=feature_map.device, requires_grad=True)
+    # --- Filter out background (ID=0) ---
+    is_fg = (unique_ids != 0)
+    if is_fg.sum() < 2: # Need at least 2 foreground clusters
+        return torch.tensor(0.0, device=features.device, requires_grad=True)
 
-    centroids = []
-    cluster_feats = []
+    # Map original IDs to a contiguous range [0, K-1] for indexing
+    fg_ids = unique_ids[is_fg]
+    id_map = -torch.ones(int(unique_ids.max()) + 1, dtype=torch.long, device=features.device)
+    id_map[fg_ids] = torch.arange(len(fg_ids), device=features.device)
+    fg_indices = id_map[masks] # [HW], -1 for bg pixels
 
-    for inst_id in unique_ids:
-        idx = (masks == inst_id).nonzero(as_tuple=True)[0]
-        if idx.numel() < min_cluster_size:
-            continue
-        feats_i = features[idx]   # [Ni, D]
-        centroid = feats_i.mean(dim=0)
-        centroid = F.normalize(centroid, dim=0)
-        centroids.append(centroid)
-        cluster_feats.append(feats_i)
+    # --- Vectorized Centroid Calculation ---
+    num_clusters = len(fg_ids)
+    # Sum features for each cluster
+    sum_feats = torch.zeros(num_clusters, D, device=features.device)
+    sum_feats.index_add_(0, fg_indices[fg_indices != -1], features[fg_indices != -1])
+    # Count pixels in each cluster
+    counts = torch.bincount(fg_indices[fg_indices != -1], minlength=num_clusters).float()
 
-    if len(centroids) < 2:
-        return torch.tensor(0.0, device=feature_map.device, requires_grad=True)
+    # --- Filter out tiny clusters ---
+    is_valid_cluster = counts >= min_cluster_size
+    if is_valid_cluster.sum() < 2:
+        return torch.tensor(0.0, device=features.device, requires_grad=True)
 
-    centroids = torch.stack(centroids, dim=0)   # [K, D]
-    loss = 0.0
+    # Compute centroids for valid clusters only
+    centroids = sum_feats[is_valid_cluster] / counts[is_valid_cluster].unsqueeze(1)
+    centroids = F.normalize(centroids, dim=-1)
 
-    for feats_i, centroid_i in zip(cluster_feats, centroids):
-        # cosine sim between each pixel feat and all centroids
-        sims = feats_i @ centroids.T   # [Ni, K]
-        # temperature φ_p = mean similarity within this cluster (paper Sec 3.2)
-        phi = (feats_i @ centroid_i).mean().clamp(min=eps)
-        logits = sims / phi
-        labels = torch.arange(len(centroids), device=feature_map.device)
-        # For this cluster, positives are centroid_i; so use cross-entropy target
-        target = torch.full((feats_i.shape[0],), labels.tolist().index(labels[centroids==centroid_i].item()), dtype=torch.long, device=feature_map.device)
-        # Actually simpler: positives are index of centroid_i
-        pos_idx = (centroids == centroid_i).all(dim=1).nonzero(as_tuple=True)[0].item()
-        targets = torch.full((feats_i.shape[0],), pos_idx, device=feature_map.device, dtype=torch.long)
+    # --- Vectorized Loss Calculation ---
+    # Remap indices to only include valid clusters
+    valid_map = -torch.ones(num_clusters, dtype=torch.long, device=features.device)
+    valid_map[is_valid_cluster] = torch.arange(is_valid_cluster.sum(), device=features.device)
+    final_indices = valid_map[fg_indices]
 
-        loss += F.cross_entropy(logits, targets)
+    # Consider only pixels belonging to valid foreground clusters
+    active_pixels = final_indices != -1
+    active_feats = features[active_pixels]
+    active_targets = final_indices[active_pixels]
 
-    return loss / len(cluster_feats)
+    # Cosine similarity between each pixel and all valid centroids
+    sims = active_feats @ centroids.T # [Num_Active_Pixels, Num_Valid_Clusters]
+
+    # Temperature φ is mean similarity of pixels to their own centroid
+    # Get the similarity score for the correct cluster for each pixel
+    pos_sims = sims[torch.arange(active_feats.shape[0]), active_targets]
+    # Average these scores per cluster to get temperature phi
+    sum_pos_sims = torch.zeros(centroids.shape[0], device=features.device)
+    sum_pos_sims.index_add_(0, active_targets, pos_sims)
+    valid_counts = torch.bincount(active_targets, minlength=centroids.shape[0])
+    phi = sum_pos_sims / valid_counts.clamp(min=1)
+    phi = phi.clamp(min=eps)
+
+    # Broadcast temperature back to each pixel
+    temp_per_pixel = phi[active_targets]
+    logits = sims / temp_per_pixel.unsqueeze(1)
+
+    return F.cross_entropy(logits, active_targets)
 
 
 def cgc_spatial_regularizer(
     features: torch.Tensor,   # [N, D], per-Gaussian features
     positions: torch.Tensor,  # [N, 3], Gaussian means
+    num_samples: int = 8192,
     k_near: int = 2,
     k_far: int = 5,
     lambda_near: float = 0.05,
     lambda_far: float = 0.15,
     eps: float = 1e-6
 ) -> torch.Tensor:
-    """
-    Spatial Similarity Regularization (Sec 3.3 in CGC).
-    Encourages nearby Gaussians to have similar features,
-    discourages very distant Gaussians from being too similar.
-    """
+        """
+        Optimized Spatial Similarity Regularization (Sec 3.3 in CGC).
+        Avoids O(N^2) by operating on a random subset of Gaussians.
+        """
+        N, D = features.shape
+        # If not enough points, or sampling is disabled, exit.
+        if N < num_samples or N < (k_near + k_far + 1):
+            return torch.tensor(0.0, device=features.device, requires_grad=True)
 
-    N, D = features.shape
-    if N < (k_near + k_far + 1):
-        return torch.tensor(0.0, device=features.device, requires_grad=True)
+        # --- KEY CHANGE: Randomly sample a subset of Gaussians ---
+        # This is the core optimization to avoid the N x N matrix.
+        sample_idx = torch.randperm(N, device=features.device)[:num_samples]
+        sample_features = features[sample_idx]
+        sample_positions = positions[sample_idx]
+        # ---------------------------------------------------------
 
-    # Normalize features
-    f_norm = F.normalize(features, dim=-1)
+        # Normalize features for the sampled points
+        f_norm = F.normalize(sample_features, dim=-1)
 
-    # Compute pairwise distances in 3D (positions)
-    with torch.no_grad():
-        dist = torch.cdist(positions, positions)  # [N, N]
-        near_idx = dist.topk(k_near+1, largest=False).indices[:, 1:]   # skip self
-        far_idx = dist.topk(k_far, largest=True).indices
+        # Compute pairwise distances ONLY for the sampled points
+        with torch.no_grad():
+            # dist is now a manageable [num_samples, num_samples] matrix
+            dist = torch.cdist(sample_positions, sample_positions)
+            near_idx = dist.topk(k_near + 1, largest=False).indices[:, 1:] # skip self
+            far_idx = dist.topk(k_far, largest=True).indices
 
-    # Cosine similarities
-    sim = f_norm @ f_norm.T   # [N, N]
+        # Cosine similarities ONLY for the sampled points
+        # sim is also a manageable [num_samples, num_samples] matrix
+        sim = f_norm @ f_norm.T
 
-    # L_near: encourage high similarity for close neighbors
-    near_sims = sim[torch.arange(N).unsqueeze(1), near_idx]  # [N, k_near]
-    loss_near = ((1 - near_sims)**2).mean()
+        # L_near: encourage high similarity for close neighbors
+        S = sample_features.shape[0]
+        near_sims = sim[torch.arange(S).unsqueeze(1), near_idx]
+        loss_near = ((1 - near_sims)**2).mean()
 
-    # L_far: encourage low similarity for far neighbors
-    far_sims = sim[torch.arange(N).unsqueeze(1), far_idx]    # [N, k_far]
-    loss_far = (far_sims**2).mean()
+        # L_far: encourage low similarity for far neighbors
+        far_sims = sim[torch.arange(S).unsqueeze(1), far_idx]
+        loss_far = (far_sims**2).mean()
 
-    return lambda_near * loss_near + lambda_far * loss_far
+        return lambda_near * loss_near + lambda_far * loss_far
+
 
 
 # ========= Segmentation Utils End =======

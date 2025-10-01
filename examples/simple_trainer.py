@@ -11,10 +11,12 @@ import imageio
 import numpy as np
 import torch
 import torch.nn.functional as F
+import torchvision.utils as vutils
 import tqdm
 import tyro
 import viser
 import yaml
+from sklearn.decomposition import PCA
 from datasets.colmap import Dataset, Parser
 from datasets.traj import (
     generate_ellipse_path_z,
@@ -200,7 +202,7 @@ class Config:
     # Learning rate for the identity vectors and MLP
     identity_lr: float = 1.6e-3
     # Weight for the segmentation loss
-    segmentation_lambda: float = 0.1
+    segmentation_lambda: float = 0.3
     # Start segmentation training after this many steps
     segmentation_start_iter: int = 1000
 
@@ -209,12 +211,13 @@ class Config:
 
     # Contrastive Gaussian Clustering params
     cgc_iter_cc: int = 50
-    cgc_iter_reg: int = 100
+    cgc_iter_reg: int = 500
     cgc_min_cluster: int = 30
     cgc_k_near: int = 2
     cgc_k_far: int = 5
     cgc_lambda_near: float = 0.05
     cgc_lambda_far: float = 0.15
+    cgc_reg_samples = 8192
 
     # Whether to use normal maps
     load_normals: bool = False
@@ -914,61 +917,62 @@ class Runner:
 
             # --- Segmentation Rendering and Loss ---
 
-            loss_seg = torch.tensor(0.0, device=device)
-            if cfg.with_segmentation and step >= cfg.segmentation_start_iter and instance_mask is not None:
-                # Process identity vectors through the MLP
-                raw_identities = self.splats["identity_encodings"]
-                processed_identities = self.segmentation_head(raw_identities)
-
-                # Render the identity features
-                identity_map, _, _ = self.rasterize_splats(
-                    camtoworlds=camtoworlds,
-                    Ks=Ks,
-                    width=width,
-                    height=height,
-                    override_features=processed_identities, # Use our new argument
-                    sh_degree=None, # Ensure features are not treated as SH
-                    # ... (other essential rendering args)
-                )
-
-                # Calculate the segmentation loss (assuming batch size of 1)
-                loss_seg = contrastive_segmentation_loss(identity_map[0], instance_mask[0])
-                loss += cfg.segmentation_lambda * loss_seg
-
-
-            # loss_cgc = torch.tensor(0.0, device=device)
-            # loss_reg = torch.tensor(0.0, device=device)
-
+            # loss_seg = torch.tensor(0.0, device=device)
             # if cfg.with_segmentation and step >= cfg.segmentation_start_iter and instance_mask is not None:
+            #     # Process identity vectors through the MLP
             #     raw_identities = self.splats["identity_encodings"]
             #     processed_identities = self.segmentation_head(raw_identities)
 
-            #     # Render the per-pixel feature map
-            #     feat_map, _, _ = self.rasterize_splats(
+            #     # Render the identity features
+            #     identity_map, _, _ = self.rasterize_splats(
             #         camtoworlds=camtoworlds,
             #         Ks=Ks,
             #         width=width,
             #         height=height,
-            #         override_features=processed_identities,
-            #         sh_degree=None,
+            #         override_features=processed_identities, # Use our new argument
+            #         sh_degree=None, # Ensure features are not treated as SH
+            #         # ... (other essential rendering args)
             #     )
 
-            #     # Contrastive clustering loss (apply every N steps, e.g. 50)
-            #     if step % cfg.cgc_iter_cc == 0:
-            #         loss_cgc = cgc_contrastive_clustering_loss(
-            #             feat_map[0], instance_mask[0],
-            #             min_cluster_size=cfg.cgc_min_cluster
-            #         )
-            #         loss += cfg.segmentation_lambda * loss_cgc
+            #     # Calculate the segmentation loss (assuming batch size of 1)
+            #     loss_seg = contrastive_segmentation_loss(identity_map[0], instance_mask[0])
+            #     loss += cfg.segmentation_lambda * loss_seg
 
-            #     # Spatial reg (apply every M steps, e.g. 100)
-            #     if step % cfg.cgc_iter_reg == 0:
-            #         loss_reg = cgc_spatial_regularizer(
-            #             processed_identities, self.splats["means"],
-            #             k_near=cfg.cgc_k_near, k_far=cfg.cgc_k_far,
-            #             lambda_near=cfg.cgc_lambda_near, lambda_far=cfg.cgc_lambda_far
-            #         )
-            #         loss += loss_reg
+
+            loss_cgc = torch.tensor(0.0, device=device)
+            loss_reg = torch.tensor(0.0, device=device)
+
+            if cfg.with_segmentation and step >= cfg.segmentation_start_iter and instance_mask is not None:
+                raw_identities = self.splats["identity_encodings"]
+                processed_identities = self.segmentation_head(raw_identities)
+
+                # Render the per-pixel feature map
+                feat_map, _, _ = self.rasterize_splats(
+                    camtoworlds=camtoworlds,
+                    Ks=Ks,
+                    width=width,
+                    height=height,
+                    override_features=processed_identities,
+                    sh_degree=None,
+                )
+
+                # Contrastive clustering loss (apply every N steps, e.g. 50)
+                if step % cfg.cgc_iter_cc == 0:
+                    loss_cgc = cgc_contrastive_clustering_loss(
+                        feat_map[0], instance_mask[0],
+                        min_cluster_size=cfg.cgc_min_cluster
+                    )
+                    loss += cfg.segmentation_lambda * loss_cgc
+
+                # Spatial reg (apply every M steps, e.g. 100)
+                if step % cfg.cgc_iter_reg == 0:
+                    loss_reg = cgc_spatial_regularizer(
+                        processed_identities, self.splats["means"],
+                        num_samples=cfg.cgc_reg_samples,
+                        k_near=cfg.cgc_k_near, k_far=cfg.cgc_k_far,
+                        lambda_near=cfg.cgc_lambda_near, lambda_far=cfg.cgc_lambda_far
+                    )
+                    loss += loss_reg
 
             # --- End of Segmentation Loss ---
 
@@ -1018,10 +1022,11 @@ class Runner:
                 if cfg.depth_loss:
                     self.writer.add_scalar("train/depthloss", depthloss.item(), step)
                 if cfg.with_segmentation and step >= cfg.segmentation_start_iter:
-                    self.writer.add_scalar("train/seg_loss", loss_seg.item(), step)
-                    log_cluster_quality(identity_map, instance_mask, self.writer, step)
-                    # self.writer.add_scalar("train/seg_cgc", loss_cgc.item(), step)
-                    # self.writer.add_scalar("train/seg_reg", loss_reg.item(), step)
+                    # self.writer.add_scalar("train/seg_loss", loss_seg.item(), step)
+                    # log_cluster_quality(identity_map, instance_mask, self.writer, step)
+                    self.writer.add_scalar("train/seg_cgc", loss_cgc.item(), step)
+                    self.writer.add_scalar("train/seg_reg", loss_reg.item(), step)
+                    log_cluster_quality(feat_map, instance_mask, self.writer, step)
                 if cfg.use_bilateral_grid:
                     self.writer.add_scalar("train/tvloss", tvloss.item(), step)
                 if cfg.tb_save_image:
@@ -1095,6 +1100,47 @@ class Runner:
                         np.save(save_path, identity_map_np)
                         np.save(instance_mask_save_path, val_data["instance_mask"].numpy())
                         print(f"Identity map saved to {save_path}")
+
+                        raw_identities = self.splats["identity_encodings"].cpu().numpy()
+    
+                        # 1. Use PCA to find the 3 most important dimensions
+                        pca = PCA(n_components=3)
+                        features_3d = pca.fit_transform(raw_identities)
+                        
+                        # 2. Normalize these 3 dimensions to be in the [0, 1] range for colors
+                        min_vals = features_3d.min(axis=0)
+                        max_vals = features_3d.max(axis=0)
+                        normalized_colors = (features_3d - min_vals) / (max_vals - min_vals)
+                        
+                        # Convert back to a tensor for rendering
+                        color_features = torch.tensor(normalized_colors, dtype=torch.float32).to(device)
+                        print("Color features shape: ", color_features.shape)
+                        
+                        # 3. Render using these colors as the override_features
+                        # (The rest is the same as the render_identities.py script)
+                        feature_image, _, _ = self.rasterize_splats(
+                            camtoworlds=camtoworlds,
+                            Ks=Ks,
+                            width=width,
+                            height=height,
+                            override_features=color_features,
+                            sh_degree=None,
+                        )
+
+                        # 2. Select the first image from the batch (if multiple cameras are rendered)
+                        # The tensor shape is likely [num_cameras, H, W, C], so we take the first one.
+                        image_to_save = feature_image[0]  # Shape becomes [H, W, C]
+
+                        # 3. Permute the dimensions from (H, W, C) to (C, H, W) as expected by torchvision
+                        image_to_save = image_to_save.permute(2, 0, 1)
+
+                        # 4. (Optional but recommended) Clamp values to the valid [0, 1] range
+                        image_to_save = torch.clamp(image_to_save, 0, 1)
+
+                        # 5. Define the full output path and save the image
+                        # vutils.save_image will handle converting the float tensor to a standard image format.
+                        output_path = os.path.join(f"{cfg.result_dir}/identity_maps/", "feature_image.png")
+                        vutils.save_image(image_to_save, output_path)
                 # ------------------------------------------------------------------ #
                 # ----------------------- END OF ADDED BLOCK ----------------------- #
                 # ------------------------------------------------------------------ #

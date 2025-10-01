@@ -1,9 +1,11 @@
 import torch
+from torch.nn import functional as F
 import numpy as np
 from pathlib import Path
 import yaml
 from sklearn.cluster import DBSCAN, KMeans
 from sklearn.manifold import TSNE
+from sklearn.decomposition import PCA
 from scipy.spatial.distance import cdist
 import matplotlib.pyplot as plt
 
@@ -197,7 +199,7 @@ def DBSCAN_identity_encodings(encodings, eps, min_samples):
     print(f"Number of Gaussians in each cluster:\n{label_counts}")
 
 
-def kmeans_identity_encodings(identity_map, instance_mask, identity_encodings):
+def kmeans_identity_encodings(identity_map, instance_mask, identity_encodings, tsne=True):
     anchor_encodings = {}
     unique_ids = np.unique(instance_mask)
     unique_ids = unique_ids[unique_ids != 0]  # Exclude background (0)
@@ -215,7 +217,7 @@ def kmeans_identity_encodings(identity_map, instance_mask, identity_encodings):
         anchor_encodings[obj_id.item()] = mean_feature
         print(f"  - Found anchor for Object ID {obj_id.item()}")
 
-    all_features = encodings
+    all_features = F.normalize(identity_encodings, dim=1).numpy()
     NUM_CLUSTERS = len(anchor_encodings)
     print(f"\nRunning KMeans with {NUM_CLUSTERS} clusters")
 
@@ -229,19 +231,20 @@ def kmeans_identity_encodings(identity_map, instance_mask, identity_encodings):
 
     print("✅ K-Means clustering complete.")
 
-    print("Running t-SNE for 2D visualization (this may take a moment)...")
-    tsne = TSNE(n_components=2, verbose=1, perplexity=40, n_iter=300, random_state=42)
-    tsne_results = tsne.fit_transform(all_features)
+    if tsne:
+        print("Running t-SNE for 2D visualization (this may take a moment)...")
+        tsne = TSNE(n_components=2, verbose=1, perplexity=40, max_iter=300, random_state=42)
+        tsne_results = tsne.fit_transform(all_features)
 
-    plt.figure(figsize=(10, 8))
-    scatter = plt.scatter(tsne_results[:,0], tsne_results[:,1], c=labels, cmap='viridis', alpha=0.5, s=5)
-    plt.legend(handles=scatter.legend_elements()[0], labels=['Cluster 0', 'Cluster 1', 'Cluster 2'])
-    plt.title('t-SNE Visualization of Identity Encodings')
-    plt.xlabel('t-SNE Component 1')
-    plt.ylabel('t-SNE Component 2')
-    plt.grid(True)
-    plt.savefig("tsne_visualization.png")
-    print("Saved t-SNE plot to tsne_visualization.png")
+        plt.figure(figsize=(10, 8))
+        scatter = plt.scatter(tsne_results[:,0], tsne_results[:,1], c=kmeans_labels, cmap='viridis', alpha=0.5, s=5)
+        plt.legend(handles=scatter.legend_elements()[0], labels=['Cluster 0', 'Cluster 1', 'Cluster 2'])
+        plt.title('t-SNE Visualization of Identity Encodings')
+        plt.xlabel('t-SNE Component 1')
+        plt.ylabel('t-SNE Component 2')
+        plt.grid(True)
+        plt.savefig("/home/te/projects/splat_rigid_body/output/gsplat_spmax_cgc/identity_maps/tsne_visualization_normalized.png")
+        print("Saved t-SNE plot to tsne_visualization.png")
 
     # Get your anchor vectors and their corresponding object IDs
     anchor_ids = list(anchor_encodings.keys())
@@ -300,7 +303,7 @@ if __name__ == "__main__":
     parser.add_argument("--identity_dim", type=int, default=16, help="Identity encoding dimension")
     args = parser.parse_args()
     # Update this path to your actual checkpoint
-    CHECKPOINT_PATH = "/home/te/projects/splat_rigid_body/output/gsplat_spmax/ckpts/ckpt_6999_rank0.pt"
+    CHECKPOINT_PATH = "/home/te/projects/splat_rigid_body/output/gsplat_spmax_cgc/ckpts/ckpt_29999_rank0.pt"
     
     # Load and inspect encodings
     encodings = load_and_inspect_identity_encodings(
@@ -309,10 +312,10 @@ if __name__ == "__main__":
         # save_to_file="identity_encodings.npy"  # Optional: save to file
     )
 
-    identity_map = np.load("/home/te/projects/splat_rigid_body/output/gsplat_spmax/identity_maps/identity_map_step7000.npy")
+    identity_map = np.load("/home/te/projects/splat_rigid_body/output/gsplat_spmax_cgc/identity_maps/identity_map_step30000.npy")
     # print("Identity map shape ", identity_map.shape)
     # print("Unique identity encodings in map ", np.unique(identity_map))
-    instance_mask = np.load("/home/te/projects/splat_rigid_body/output/gsplat_spmax/identity_maps/instance_mask_step7000.npy")
+    instance_mask = np.load("/home/te/projects/splat_rigid_body/output/gsplat_spmax_cgc/identity_maps/instance_mask_step30000.npy")
     print("Instance mask shape ", instance_mask.shape)
     print("Unique instance ids in mask ", np.unique(instance_mask))
 
@@ -321,7 +324,6 @@ if __name__ == "__main__":
     #                                  image_index=0)
 
     # DBSCAN_identity_encodings(encodings.numpy(), eps=0.5, min_samples=32)
-    kmeans_identity_encodings(identity_map, instance_mask, encodings.numpy())
-
+    kmeans_identity_encodings(identity_map, instance_mask, encodings, tsne=True)
     
     print(f"\nReturned tensor shape: {encodings.shape}")
