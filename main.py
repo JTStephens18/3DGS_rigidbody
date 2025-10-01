@@ -235,6 +235,7 @@ if __name__ == '__main__':
     # parser.add_argument("--data_dir", type=str, default="/home/te/projects/InnovationDepot/up_mid_down_video", help="Path to the dataset directory")
     parser.add_argument('--ply_path', type=str, default="/home/te/projects/InnovationDepot/hloc_output_disk/gsplat_output_dapda_geometric1/ply/point_cloud_6999.ply", required=False, help='Path to the .ply file to load splats from')
     parser.add_argument("--data_dir", type=str, default="/home/te/projects/InnovationDepot/hloc_output_disk/", help="Path to the dataset directory")
+    parser.add_argument("--cluster_groups", type=str, default=None, help="Path to the cluster groups npz file")
     args = parser.parse_args()
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -275,11 +276,25 @@ if __name__ == '__main__':
     print("\nModel state after loading:")
     print(f"Number of loaded splats: {model.splats['means'].shape[0]}")
     print(f"Optimizers are ready: {'Yes' if model.optimizers else 'No'}")
-    
+
+    if args.cluster_groups is not None:
+        cluster_groups = np.load(args.cluster_groups)
+        # loaded_groups = {}
+        # for key in cluster_groups.files:
+        #     # The values are loaded as NumPy arrays, convert them back to lists
+        #     value = cluster_groups[key].tolist()
+        #     # Convert numeric keys back to integers
+        #     new_key = int(key) if key.isnumeric() else key
+        #     loaded_groups[new_key] = value
 
     world_rank, world_size = 0, 1 
     runner = Runner(local_rank=0, world_rank=world_rank, world_size=world_size, cfg=cfg)
-
+    
+    if args.cluster_groups is not None:
+        cluster_indices = torch.from_numpy(cluster_groups["1"]).long().to(device)
+        print(f"Using {len(cluster_indices)} splats from cluster 1 for rendering.")
+        # runner.splats = model.splats[cluster_indices]
+        model.splats = {k: v[cluster_indices] for k, v in model.splats.items()}
     runner.splats = model.splats
     runner.optimizers = model.optimizers
 
@@ -323,19 +338,21 @@ if __name__ == '__main__':
         masks=masks,
     )
 
-    # save_rendered_image(
-    #     renders,
-    #     "output/rendered_image1.png"
-    # )
+    save_rendered_image(
+        renders,
+        f"{cfg.data_dir}/test_rendered_image_cluster.png"
+    )
 
-    for i in range(200):
-        paused = True
-        if i == 100:
-            paused = False
-        while paused:
-            time.sleep(0.1)
-        print(f"Step {i+1}/200")
-        time.sleep(0.1)
+    print("Rendered image saved")
+
+    # for i in range(200):
+    #     paused = True
+    #     if i == 100:
+    #         paused = False
+    #     while paused:
+    #         time.sleep(0.1)
+    #     print(f"Step {i+1}/200")
+    #     time.sleep(0.1)
 
     # Store the original splats to use as a base for each frame's transformation
     # original_splats = {k: v.clone().detach() for k, v in runner.splats.items()}

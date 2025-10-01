@@ -1,6 +1,7 @@
 import torch
 from torch.nn import functional as F
 import numpy as np
+import re
 from pathlib import Path
 import yaml
 from sklearn.cluster import DBSCAN, KMeans
@@ -187,111 +188,347 @@ def get_identity_map_from_checkpoint(
     print("✅ Identity map generated successfully!")
     return identity_map.squeeze(0).cpu().numpy() # Remove batch dim and move to CPU
 
-def DBSCAN_identity_encodings(encodings, eps, min_samples):
-    print(f"Running DBSCAN with eps={eps} and min_samples={min_samples}...")
-    clustering = DBSCAN(eps=eps, min_samples=min_samples, n_jobs=-1).fit(encodings)
-    labels = clustering.labels_
-    label_counts = Counter(labels)
-    num_clusters = len(set(labels)) - (1 if -1 in labels else 0)
+def dbscan_identity_encodings(identity_encodings: torch.Tensor):
+    """
+    Performs DBSCAN clustering on normalized identity encodings to find object
+    groups and a background group from noise points.
+    
+    Args:
+        identity_encodings (torch.Tensor): The [N, D] tensor of features for each Gaussian.
+    """
+    if not isinstance(identity_encodings, torch.Tensor):
+        raise TypeError("Input 'identity_encodings' must be a PyTorch tensor.")
 
-    print(f"✅ Clustering complete!")
-    print(f"Found {num_clusters} potential dominoes (clusters).")
-    print(f"Number of Gaussians in each cluster:\n{label_counts}")
+    print("✅ Normalizing identity encodings...")
+    # 1. Normalize the encodings, as this is what the network was trained on.
+    # This makes the Euclidean distance used by DBSCAN more meaningful.
+    all_features = F.normalize(identity_encodings, dim=1).cpu().numpy()
 
-
-def kmeans_identity_encodings(identity_map, instance_mask, identity_encodings, tsne=True):
-    anchor_encodings = {}
-    unique_ids = np.unique(instance_mask)
-    unique_ids = unique_ids[unique_ids != 0]  # Exclude background (0)
-    print("Finding anchor encodings for each object ID...")
-    for obj_id in unique_ids:
-        # Create a boolean mask for the current object
-        mask = (instance_mask == obj_id)
+    # --- Parameter Tuning Section ---
+    print("\n🔎 Searching for the best 'eps' value...")
+    
+    # Set a fixed min_samples. This usually requires less tuning than eps.
+    # It should be large enough to not consider tiny random groups as objects.
+    MIN_SAMPLES = 200 
+    
+    best_eps = None
+    
+    # Iterate through a range of potential eps values
+    for eps_candidate in np.arange(0.1, 0.5, 0.02):
+        # 2. Run DBSCAN with the candidate eps
+        db = DBSCAN(eps=eps_candidate, min_samples=MIN_SAMPLES, n_jobs=-1).fit(all_features)
         
-        # Select the feature vectors from the identity map that correspond to this object
-        object_features = identity_map[mask]
+        # Get the unique cluster labels. Noise is labeled -1.
+        unique_labels = set(db.labels_)
         
-        # Calculate the mean vector for this object
-        mean_feature = np.mean(object_features, axis=0)
+        # Calculate the number of actual clusters found (excluding the noise group)
+        num_clusters = len(unique_labels) - (1 if -1 in unique_labels else 0)
         
-        anchor_encodings[obj_id.item()] = mean_feature
-        print(f"  - Found anchor for Object ID {obj_id.item()}")
+        print(f"  - Trying eps={eps_candidate:.2f}... Found {num_clusters} clusters.")
 
-    all_features = F.normalize(identity_encodings, dim=1).numpy()
-    NUM_CLUSTERS = len(anchor_encodings)
-    print(f"\nRunning KMeans with {NUM_CLUSTERS} clusters")
+        # 3. Check if we found the desired number of clusters
+        if num_clusters == 3:
+            print(f"🎉 Found optimal eps: {eps_candidate:.2f}\n")
+            best_eps = eps_candidate
+            break
+            
+    if best_eps is None:
+        print("\n⚠️ Could not automatically find an 'eps' that resulted in 3 clusters.")
+        print("Please try adjusting the search range in the script or the MIN_SAMPLES value.")
+        return
 
-    kmeans = KMeans(n_clusters=NUM_CLUSTERS, random_state=42, n_init='auto').fit(all_features)
+    # --- Final Clustering and Grouping ---
+    print("Running final DBSCAN with optimal parameters...")
+    final_db = DBSCAN(eps=best_eps, min_samples=MIN_SAMPLES, n_jobs=-1).fit(all_features)
+    labels = final_db.labels_
+    
+    # The number of clusters in labels, ignoring noise if present.
+    n_clusters_ = len(set(labels)) - (1 if -1 in labels else 0)
+    n_noise_ = list(labels).count(-1)
 
-    # These are the results from K-Means:
-    # 1. The cluster label (0, 1, or 2) assigned to each Gaussian
-    kmeans_labels = kmeans.labels_
-    # 2. The center (centroid) of each of the 3 clusters found
-    kmeans_centroids = kmeans.cluster_centers_
+    print(f'Estimated number of clusters: {n_clusters_}')
+    print(f'Estimated number of noise points (background): {n_noise_}')
 
-    print("✅ K-Means clustering complete.")
-
-    if tsne:
-        print("Running t-SNE for 2D visualization (this may take a moment)...")
-        tsne = TSNE(n_components=2, verbose=1, perplexity=40, max_iter=300, random_state=42)
-        tsne_results = tsne.fit_transform(all_features)
-
-        plt.figure(figsize=(10, 8))
-        scatter = plt.scatter(tsne_results[:,0], tsne_results[:,1], c=kmeans_labels, cmap='viridis', alpha=0.5, s=5)
-        plt.legend(handles=scatter.legend_elements()[0], labels=['Cluster 0', 'Cluster 1', 'Cluster 2'])
-        plt.title('t-SNE Visualization of Identity Encodings')
-        plt.xlabel('t-SNE Component 1')
-        plt.ylabel('t-SNE Component 2')
-        plt.grid(True)
-        plt.savefig("/home/te/projects/splat_rigid_body/output/gsplat_spmax_cgc/identity_maps/tsne_visualization_normalized.png")
-        print("Saved t-SNE plot to tsne_visualization.png")
-
-    # Get your anchor vectors and their corresponding object IDs
-    anchor_ids = list(anchor_encodings.keys())
-    anchor_vectors = np.array(list(anchor_encodings.values()))
-
-    # Calculate the distance between each K-Means centroid and each anchor vector
-    # This creates a distance matrix: rows are K-Means clusters, columns are your objects
-    distance_matrix = cdist(kmeans_centroids, anchor_vectors, 'euclidean')
-
-    # For each K-Means cluster, find the closest anchor object ID
-    # `argmin(axis=1)` finds the index of the minimum value in each row
-    closest_anchor_indices = np.argmin(distance_matrix, axis=1)
-
-    # Create the final mapping from the arbitrary K-Means label to your actual object ID
-    # e.g., {0: 2, 1: 3, 2: 1} means "K-Means cluster 0 is actually Object ID 2"
-    kmeans_to_object_id_map = {kmeans_label: anchor_ids[anchor_idx] for kmeans_label, anchor_idx in enumerate(closest_anchor_indices)}
-
-    print("\nMapping K-Means clusters to Object IDs:")
-    print(kmeans_to_object_id_map)
-
-    # Initialize a dictionary to hold the lists of Gaussian indices
-    # Use the real object IDs as keys
-    object_groups = {obj_id: [] for obj_id in anchor_ids}
-    object_groups["background"] = []
-
-    # Keep track of all Gaussians that get assigned to a domino
-    assigned_indices = set()
-
-    # Iterate through every Gaussian and its assigned K-Means label
-    for gaussian_idx, kmeans_label in enumerate(kmeans_labels):
-        # Look up the real object ID using our map
-        object_id = kmeans_to_object_id_map[kmeans_label]
+    # 4. Assemble the final object groups
+    # Important: The cluster labels from DBSCAN (0, 1, 2...) are arbitrary.
+    # You will still need your anchor-based mapping logic from the K-Means script
+    # to assign these to your true object IDs (1, 2, 3 from the mask).
+    
+    # For now, we can group by the arbitrary DBSCAN labels.
+    object_groups = {}
+    for label in set(labels):
+        if label == -1:
+            # All noise points are considered background
+            group_name = "background"
+        else:
+            # These are your object clusters
+            group_name = f"object_cluster_{label}"
         
-        # Add the Gaussian's index to the correct object group
-        object_groups[object_id].append(gaussian_idx)
-        assigned_indices.add(gaussian_idx)
-
-    # Now, find all the unassigned Gaussians for the background group
-    num_total_gaussians = all_features.shape[0]
-    all_indices = set(range(num_total_gaussians))
-    background_indices = all_indices - assigned_indices
-    object_groups["background"] = list(background_indices)
-
+        # Find all indices where the label matches
+        indices = np.where(labels == label)[0]
+        object_groups[group_name] = indices.tolist()
 
     print("\n✅ Final Object Groups Assembled!")
     for name, group in object_groups.items():
         print(f"  - Group '{name}': {len(group)} Gaussians")
+        
+    return object_groups
+
+def kmeans_identity_encodings(
+    identity_map: np.ndarray,
+    instance_mask: np.ndarray,
+    identity_encodings: torch.Tensor,
+    tsne: bool = True
+):
+    """
+    Performs K-Means clustering on Gaussian identity encodings using an intelligent
+    initialization strategy based on anchor vectors from a rendered identity map.
+
+    Args:
+        identity_map: A rendered feature map [H, W, D] from a single view.
+        instance_mask: A ground-truth instance mask [H, W] for the same view.
+        identity_encodings: The full tensor of identity encodings for all Gaussians [N, D].
+        output_dir: Directory to save the t-SNE plot.
+        tsne: Whether to generate and save a t-SNE visualization.
+
+    Returns:
+        A dictionary mapping object IDs (including "background") to lists of
+        Gaussian indices belonging to that object.
+    """
+    # 1. Calculate Normalized Anchor Vectors for Initialization
+    print("Finding normalized anchor vectors for K-Means initialization...")
+    anchor_vectors_list = []
+    anchor_ids_list = []
+    unique_ids = np.unique(instance_mask)
+    unique_ids = unique_ids[unique_ids != 0]  # Exclude background
+
+    for obj_id in unique_ids:
+        mask = (instance_mask == obj_id)
+        object_features = identity_map[mask]
+        mean_feature = np.mean(object_features, axis=0)
+        
+        # CRITICAL: Normalize the anchor vector to match the data being clustered
+        norm_feat = mean_feature / (np.linalg.norm(mean_feature) + 1e-6)
+        
+        anchor_vectors_list.append(norm_feat)
+        anchor_ids_list.append(obj_id.item())
+        print(f"  - Calculated anchor for Object ID {obj_id.item()}")
+
+    initial_centroids = np.array(anchor_vectors_list)
+    NUM_CLUSTERS = len(initial_centroids)
+
+    # 2. Create a Reliable Mapping *Before* Clustering
+    # The mapping is certain because we control the initial centroid order.
+    # K-Means cluster 'i' will correspond to the i-th anchor vector we provide.
+    kmeans_to_object_id_map = {i: obj_id for i, obj_id in enumerate(anchor_ids_list)}
+    print("\nUsing pre-defined mapping based on initialization:")
+    print(kmeans_to_object_id_map)
+
+    # 3. Normalize the Full Feature Set for Clustering
+    # This aligns the data with the training loss metric (cosine similarity).
+    all_features = F.normalize(identity_encodings.cpu(), dim=1).numpy()
+
+    # 4. Run K-Means with Intelligent Initialization
+    print(f"\nRunning KMeans with {NUM_CLUSTERS} clusters (using anchor initialization)")
+    kmeans = KMeans(
+        n_clusters=NUM_CLUSTERS,
+        init=initial_centroids,  # Use anchors as the starting point
+        n_init=1,                # Only need one run with a good initialization
+        random_state=42
+    ).fit(all_features)
+    print("✅ K-Means clustering complete.")
+
+    kmeans_labels = kmeans.labels_
+
+    # 5. Optional: Generate t-SNE visualization with the new, correct labels
+    if tsne:
+        print("Running t-SNE for 2D visualization (this may take a moment)...")
+        tsne_model = TSNE(n_components=2, verbose=1, perplexity=40, max_iter=300, random_state=42)
+        tsne_results = tsne_model.fit_transform(all_features)
+
+        plt.figure(figsize=(10, 8))
+        scatter = plt.scatter(tsne_results[:, 0], tsne_results[:, 1], c=kmeans_labels, cmap='viridis', alpha=0.5, s=5)
+        
+        # Create legend labels from our known mapping
+        legend_labels = [f'Cluster {i} (Obj ID {kmeans_to_object_id_map[i]})' for i in range(NUM_CLUSTERS)]
+        plt.legend(handles=scatter.legend_elements()[0], labels=legend_labels)
+        
+        plt.title('t-SNE Visualization of Identity Encodings')
+        plt.xlabel('t-SNE Component 1')
+        plt.ylabel('t-SNE Component 2')
+        plt.grid(True)
+        plt.savefig(f"{args.data_dir}/identity_maps/tsne_visualization_new.png")
+        print(f"✅ Saved t-SNE plot")
+
+    # 6. Assemble Final Object Groups Using the Reliable Map
+    object_groups = {obj_id: [] for obj_id in anchor_ids_list}
+    assigned_indices = set()
+
+    for gaussian_idx, kmeans_label in enumerate(kmeans_labels):
+        # Check if the label is valid (sometimes K-Means can produce an unexpected label)
+        if kmeans_label in kmeans_to_object_id_map:
+            object_id = kmeans_to_object_id_map[kmeans_label]
+            object_groups[object_id].append(gaussian_idx)
+            assigned_indices.add(gaussian_idx)
+
+    # Assign all remaining Gaussians to a "background" group
+    num_total_gaussians = all_features.shape[0]
+    all_indices = set(range(num_total_gaussians))
+    background_indices = all_indices - assigned_indices
+    object_groups["background"] = list(background_indices)
+    
+    print("\n✅ Final Object Groups Assembled!")
+    for name, group in object_groups.items():
+        print(f"  - Group '{name}': {len(group)} Gaussians")
+        
+    return object_groups
+
+
+def kmeans_identity_encodings_background(
+    identity_map: np.ndarray,
+    instance_mask: np.ndarray,
+    identity_encodings: torch.Tensor,
+    background_percentile: float = 95.0,
+    tsne: bool = True
+):
+    """
+    Performs K-Means clustering to segment Gaussians, with a post-processing
+    step to identify and assign outliers to a background group.
+
+    Args:
+        identity_map: A rendered feature map [H, W, D] from a single view.
+        instance_mask: A ground-truth instance mask [H, W] for the same view.
+        identity_encodings: The full tensor of identity encodings [N, D].
+        output_dir: Directory to save the t-SNE plot.
+        background_percentile: The distance percentile within each cluster
+            above which a Gaussian is considered background (e.g., 95.0 means
+            the 5% furthest Gaussians are re-assigned).
+        tsne: Whether to generate and save a t-SNE visualization.
+
+    Returns:
+        A dictionary mapping object IDs (including "background") to lists of
+        Gaussian indices belonging to that object.
+    """
+    # 1. Calculate Normalized Anchor Vectors for Initialization
+    print("Finding normalized anchor vectors for K-Means initialization...")
+    anchor_vectors_list = []
+    anchor_ids_list = []
+    unique_ids = np.unique(instance_mask)
+    unique_ids = unique_ids[unique_ids != 0]
+
+    for obj_id in unique_ids:
+        mask = (instance_mask == obj_id)
+        if not np.any(mask): continue
+        object_features = identity_map[mask]
+        mean_feature = np.mean(object_features, axis=0)
+        norm_feat = mean_feature / (np.linalg.norm(mean_feature) + 1e-6)
+        anchor_vectors_list.append(norm_feat)
+        anchor_ids_list.append(obj_id.item())
+        print(f"  - Calculated anchor for Object ID {obj_id.item()}")
+
+    initial_centroids = np.array(anchor_vectors_list)
+    NUM_CLUSTERS = len(initial_centroids)
+
+    # 2. Create a Reliable Mapping *Before* Clustering
+    kmeans_to_object_id_map = {i: obj_id for i, obj_id in enumerate(anchor_ids_list)}
+    print("\nUsing pre-defined mapping based on initialization:")
+    print(kmeans_to_object_id_map)
+
+    # 3. Normalize the Full Feature Set and Run K-Means
+    all_features = F.normalize(identity_encodings.cpu(), dim=1).numpy()
+    print(f"\nRunning KMeans with {NUM_CLUSTERS} clusters (using anchor initialization)")
+    kmeans = KMeans(
+        n_clusters=NUM_CLUSTERS,
+        init=initial_centroids,
+        n_init=1,
+        random_state=42
+    ).fit(all_features)
+    print("✅ K-Means clustering complete.")
+
+    initial_labels = kmeans.labels_
+    final_labels = np.copy(initial_labels)
+
+    # 4. NEW: Identify and Re-assign Outliers to Background
+    print(f"\nIdentifying outliers (top {100 - background_percentile:.1f}%) for background group...")
+    # Get the distance from each point to every cluster's center
+    distances_to_all_centroids = kmeans.transform(all_features)
+    
+    for i in range(NUM_CLUSTERS):
+        # Get all points assigned to this cluster
+        cluster_mask = (initial_labels == i)
+        
+        # Get the distance of each of these points to its *own* centroid
+        distances_to_own_centroid = distances_to_all_centroids[cluster_mask, i]
+        
+        # If the cluster is empty, skip
+        if len(distances_to_own_centroid) == 0: continue
+            
+        # Calculate the distance threshold for this specific cluster
+        threshold = np.percentile(distances_to_own_centroid, background_percentile)
+        
+        # Find which points in this cluster are outliers (distance > threshold)
+        point_indices_in_cluster = np.where(cluster_mask)[0]
+        outlier_mask_in_cluster = (distances_to_own_centroid > threshold)
+        outlier_indices = point_indices_in_cluster[outlier_mask_in_cluster]
+        
+        # Re-assign these outliers to the background (label -1)
+        final_labels[outlier_indices] = -1
+        print(f"  - Re-assigned {len(outlier_indices)} Gaussians from Cluster {i} to background.")
+
+    # 5. Assemble Final Object Groups Using the New Labels
+    object_groups = {obj_id: [] for obj_id in anchor_ids_list}
+    object_groups["background"] = []
+
+    for gaussian_idx, label in enumerate(final_labels):
+        if label == -1:
+            object_groups["background"].append(gaussian_idx)
+        else:
+            object_id = kmeans_to_object_id_map[label]
+            object_groups[object_id].append(gaussian_idx)
+    
+    print("\n✅ Final Object Groups Assembled!")
+    for name, group in object_groups.items():
+        print(f"  - Group '{name}': {len(group)} Gaussians")
+
+    # 6. Optional: t-SNE visualization with background points
+    if tsne:
+        # (Same t-SNE logic, but using `final_labels` to show background points)
+        print("\nRunning t-SNE for 2D visualization...")
+        tsne_model = TSNE(n_components=2, verbose=1, perplexity=40, max_iter=300, random_state=42)
+        tsne_results = tsne_model.fit_transform(all_features)
+        
+        # Use a different color for the background points
+        plt.figure(figsize=(10, 8))
+        # Use a colormap and normalize labels to map colors correctly
+        cmap = plt.cm.viridis
+        unique_labels = np.unique(final_labels)
+        norm = plt.Normalize(vmin=unique_labels.min(), vmax=unique_labels.max())
+        scatter = plt.scatter(tsne_results[:, 0], tsne_results[:, 1], c=final_labels, cmap='viridis', alpha=0.5, s=5)
+        
+        legend_handles = []
+        legend_labels = []
+        
+        # Handle for Background
+        if -1 in unique_labels:
+            legend_handles.append(plt.Line2D([0], [0], marker='o', color='w',
+                                  markerfacecolor=cmap(norm(-1)), markersize=8, label='Background'))
+            legend_labels.append("Background")
+
+        # Handles for Object Clusters
+        for label_val, obj_id in sorted(kmeans_to_object_id_map.items()):
+            legend_handles.append(plt.Line2D([0], [0], marker='o', color='w',
+                                  markerfacecolor=cmap(norm(label_val)), markersize=8, label=f'Cluster {label_val} (Obj ID {obj_id})'))
+            legend_labels.append(f'Cluster {label_val} (Obj ID {obj_id})')
+        
+        plt.legend(handles=legend_handles, labels=legend_labels)
+        plt.title('t-SNE Visualization of Identity Encodings (with Background)')
+        plt.xlabel('t-SNE Component 1')
+        plt.ylabel('t-SNE Component 2')
+        plt.grid(True)
+        plt.savefig(f"{args.data_dir}/identity_maps/tsne_visualization_background.png")
+        print(f"✅ Saved t-SNE plot")
+        
+    return object_groups
 
 
 # Example usage
@@ -303,7 +540,7 @@ if __name__ == "__main__":
     parser.add_argument("--identity_dim", type=int, default=16, help="Identity encoding dimension")
     args = parser.parse_args()
     # Update this path to your actual checkpoint
-    CHECKPOINT_PATH = "/home/te/projects/splat_rigid_body/output/gsplat_spmax_cgc/ckpts/ckpt_29999_rank0.pt"
+    CHECKPOINT_PATH = f"{args.data_dir}/ckpts/ckpt_29999_rank0.pt"
     
     # Load and inspect encodings
     encodings = load_and_inspect_identity_encodings(
@@ -312,10 +549,10 @@ if __name__ == "__main__":
         # save_to_file="identity_encodings.npy"  # Optional: save to file
     )
 
-    identity_map = np.load("/home/te/projects/splat_rigid_body/output/gsplat_spmax_cgc/identity_maps/identity_map_step30000.npy")
+    identity_map = np.load(f"{args.data_dir}/identity_maps/identity_map_step30000.npy")
     # print("Identity map shape ", identity_map.shape)
     # print("Unique identity encodings in map ", np.unique(identity_map))
-    instance_mask = np.load("/home/te/projects/splat_rigid_body/output/gsplat_spmax_cgc/identity_maps/instance_mask_step30000.npy")
+    instance_mask = np.load(f"{args.data_dir}/identity_maps/instance_mask_step30000.npy")
     print("Instance mask shape ", instance_mask.shape)
     print("Unique instance ids in mask ", np.unique(instance_mask))
 
@@ -323,7 +560,12 @@ if __name__ == "__main__":
     #                                  cfg=args,
     #                                  image_index=0)
 
-    # DBSCAN_identity_encodings(encodings.numpy(), eps=0.5, min_samples=32)
-    kmeans_identity_encodings(identity_map, instance_mask, encodings, tsne=True)
+    # dbscan_identity_encodings(encodings)
+    object_groups = kmeans_identity_encodings_background(identity_map, instance_mask, encodings, tsne=True)
+
+    cluster_groups_save_path = f"{args.data_dir}/identity_maps/cluster_groups.npy"
+    save_dict = {str(k): v for k, v in object_groups.items()}
+    np.savez_compressed(cluster_groups_save_path, **save_dict)
+    print(f"✅ Object groups saved to {cluster_groups_save_path}")
     
     print(f"\nReturned tensor shape: {encodings.shape}")
